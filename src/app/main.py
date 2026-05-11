@@ -1,14 +1,24 @@
 # src/app/main.py
-from fastapi import FastAPI
+# Load .env so direct invocations like `uvicorn app.main:app` also pick up vars.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except ImportError:
+    pass
+
+from fastapi import Depends, FastAPI
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.services.gemini_client import get_gemini_client, init_gemini_client, GeminiClientNotInitializedError
 from app.services.session_manager import init_session_managers
+from app.auth import verify_api_key, API_KEY_ENV_VAR
 from app.logger import logger
 
 # Import endpoint routers
 from app.endpoints import gemini, chat, google_generative
+
+import os
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -60,7 +70,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# API key authentication: enabled when GEMINI_API_KEY env var is set.
+if os.environ.get(API_KEY_ENV_VAR, "").strip():
+    logger.info(f"API key authentication enabled (env: {API_KEY_ENV_VAR}).")
+else:
+    logger.info(f"API key authentication disabled ({API_KEY_ENV_VAR} not set).")
+
+_auth_dependencies = [Depends(verify_api_key)]
+
 # Register the endpoint routers for WebAI-to-API
-app.include_router(gemini.router)
-app.include_router(chat.router)
-app.include_router(google_generative.router)
+app.include_router(gemini.router, dependencies=_auth_dependencies)
+app.include_router(chat.router, dependencies=_auth_dependencies)
+app.include_router(google_generative.router, dependencies=_auth_dependencies)

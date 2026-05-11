@@ -99,6 +99,66 @@ This design provides both **speed and redundancy**, ensuring flexibility dependi
 
 ---
 
+## Authentication
+
+The WebAI-to-API endpoints support optional API key authentication, enabled by setting the `GEMINI_API_KEY` environment variable.
+
+- **Disabled (default):** If `GEMINI_API_KEY` is unset or empty, all endpoints are open — same as before. Convenient for local use.
+- **Enabled:** If `GEMINI_API_KEY` is set, every request to `/gemini`, `/gemini-chat`, `/translate`, `/v1/*`, and `/v1beta/models/*` must present a matching key, otherwise the server returns `401 Unauthorized`.
+
+### Setting the key
+
+```bash
+# Linux / macOS
+export GEMINI_API_KEY="your-secret-key"
+poetry run python src/run.py
+```
+
+```powershell
+# Windows PowerShell
+$env:GEMINI_API_KEY = "your-secret-key"
+poetry run python src/run.py
+```
+
+```bash
+# Docker
+docker run -e GEMINI_API_KEY="your-secret-key" -p 6969:6969 webai-to-api
+```
+
+### Passing the key from clients
+
+Any one of the following is accepted — pick whichever matches your client:
+
+| Header / Param                 | Style                  | Typical client                       |
+| ------------------------------ | ---------------------- | ------------------------------------ |
+| `Authorization: Bearer <key>`  | OpenAI-compatible      | OpenAI SDKs, `/v1/chat/completions`  |
+| `x-goog-api-key: <key>`        | Google Generative AI   | `@google/generative-ai`, `/v1beta/*` |
+| `x-api-key: <key>`             | Generic                | curl, custom clients                 |
+| `?key=<key>` query parameter   | Google query-param     | Browser / quick tests                |
+
+### Examples
+
+```bash
+# OpenAI-compatible
+curl http://localhost:6969/v1/chat/completions \
+  -H "Authorization: Bearer your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-3.0-flash","messages":[{"role":"user","content":"Hello"}]}'
+
+# Google Generative AI compatible
+curl "http://localhost:6969/v1beta/models/gemini-3.0-flash:generateContent" \
+  -H "x-goog-api-key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"parts":[{"text":"Hello"}]}]}'
+
+# Query-param style
+curl "http://localhost:6969/v1/models?key=your-secret-key"
+```
+
+> Note: This guards only the WebAI-to-API server. The fallback gpt4free server is launched as a separate process and is not covered by `GEMINI_API_KEY`.
+
+---
+
 ## Usage
 
 Send a POST request to `/v1/chat/completions` (or any other available endpoint) with the required payload.
@@ -376,6 +436,19 @@ The project is built on a modular architecture designed for scalability and ease
 ## 🐳 Docker Deployment Guide
 
 For Docker setup and deployment instructions, please refer to the [Docker.md](Docker.md) documentation.
+
+To enable API-key authentication in Docker, set `GEMINI_API_KEY` in `.env` (or pass it via the shell at launch):
+
+```bash
+# Persistent — write to .env, then start
+echo 'GEMINI_API_KEY=your-secret-key' >> .env
+make up
+
+# Or one-shot — override from the shell (takes precedence over .env)
+GEMINI_API_KEY=your-secret-key docker-compose up -d
+```
+
+Leave `GEMINI_API_KEY` empty (or unset) to keep authentication disabled. See [Authentication](#authentication) for the accepted header/query forms.
 
 ---
 
