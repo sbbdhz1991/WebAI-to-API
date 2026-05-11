@@ -1,4 +1,12 @@
 # src/run.py
+# Load environment variables from .env as early as possible so that any
+# os.environ reads (including in spawned child processes) see them.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except ImportError:
+    pass
+
 import argparse
 import asyncio
 import uvicorn
