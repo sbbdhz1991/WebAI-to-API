@@ -29,8 +29,16 @@ default_model_gemini = gemini-3-flash
 # Provide your authentication cookies for Gemini here.
 # You can either paste them manually or log in via browser to generate them.
 [Cookies]
-gemini_cookie_1psid = 
-gemini_cookie_1psidts = 
+gemini_cookie_1psid =
+gemini_cookie_1psidts =
+
+# (Optional) Extra cookies needed for media uploads (images/PDF/video).
+# Paste the FULL value of the Cookie header from any authenticated request
+# to https://gemini.google.com (DevTools → Network → pick a request → copy
+# the Cookie request header). Leave empty if uploads work without this.
+# Format: standard Cookie header — semicolon-separated name=value pairs.
+# gemini_cookie_extra = SAPISID=...; __Secure-1PAPISID=...; SID=...; HSID=...; SSID=...; APISID=...; __Secure-3PAPISID=...
+gemini_cookie_extra =
 
 # --- AI Services Toggle ---
 # Enable or disable specific AI providers.
