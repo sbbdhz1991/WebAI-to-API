@@ -60,6 +60,8 @@ This design provides both **speed and redundancy**, ensuring flexibility dependi
 
 - 🔄 **Server Switching**: Easily switch between servers in terminal.
 
+- 📎 **File Uploads**: Send images, PDFs, video, and audio to any WebAI endpoint via `multipart/form-data`, JSON-embedded base64, or OpenAI-style multimodal `image_url` parts. See [File Uploads](#file-uploads).
+
 - 🛠️ **Modular Architecture**: Organized into clearly defined modules for API routes, services, configurations, and utilities, making development and maintenance straightforward.
 
 <p align="center">
@@ -156,6 +158,90 @@ curl "http://localhost:6969/v1/models?key=your-secret-key"
 ```
 
 > Note: This guards only the WebAI-to-API server. The fallback gpt4free server is launched as a separate process and is not covered by `GEMINI_API_KEY`.
+
+---
+
+## File Uploads
+
+`/gemini`, `/gemini-chat`, `/translate`, and `/v1/chat/completions` all accept file attachments — images, PDFs, video, and audio — in three interchangeable forms. Pick whichever fits your client.
+
+### 1. `multipart/form-data` (recommended for browsers and curl)
+
+Plain form fields plus one or more `files` parts. Filename is preserved, so MIME is inferred correctly.
+
+```bash
+# Image
+curl -F message="What's in this image?" -F model=gemini-3-flash \
+     -F files=@photo.jpg \
+     http://localhost:6969/gemini
+
+# Multiple files (image + PDF)
+curl -F message="Compare these two documents" -F model=gemini-3-pro \
+     -F files=@report.pdf -F files=@chart.png \
+     http://localhost:6969/gemini-chat
+
+# Video
+curl -F message="Summarize this clip" -F model=gemini-3-pro \
+     -F files=@demo.mp4 \
+     http://localhost:6969/gemini
+```
+
+### 2. JSON with base64-embedded files
+
+Each entry in `files` may be a server-side path string (legacy behavior) **or** an object carrying base64-encoded content. Always supply `filename` for byte payloads so the MIME type is detected.
+
+```json
+POST /gemini
+Content-Type: application/json
+
+{
+  "message": "Describe this image",
+  "model": "gemini-3-flash",
+  "files": [
+    {
+      "filename": "photo.jpg",
+      "content_base64": "/9j/4AAQSkZJRgABAQEASABIAAD..."
+    },
+    "/absolute/path/already/on/server.pdf"
+  ]
+}
+```
+
+`content_base64` also accepts a full data URL (e.g. `"data:image/png;base64,iVBORw0KGgo..."`).
+
+### 3. OpenAI-compatible multimodal (`/v1/chat/completions` only)
+
+The standard OpenAI vision format works as-is — `image_url` accepts both `data:` URLs and `http(s)://` URLs (server fetches them).
+
+```json
+POST /v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gemini-3-pro",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "What's in this picture?" },
+        { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0..." } }
+      ]
+    }
+  ]
+}
+```
+
+`/v1/chat/completions` additionally supports a `multipart/form-data` variant where the OpenAI payload is sent as a JSON string in a `payload` field alongside one or more `files` uploads:
+
+```bash
+curl http://localhost:6969/v1/chat/completions \
+  -F 'payload={"model":"gemini-3-flash","messages":[{"role":"user","content":"Describe"}]};type=application/json' \
+  -F files=@photo.jpg
+```
+
+### Size limit
+
+Total upload size per request is capped by `[Server] max_upload_size_mb` (default **100 MB**, set to `0` to disable). Requests exceeding the limit are rejected with `413 Payload Too Large`. If you front the server with nginx or another proxy, raise its body-size limit accordingly (`client_max_body_size` for nginx).
 
 ---
 
@@ -324,12 +410,13 @@ GET  /images/{filename}             # Retrieve images
 
 ### Key Configuration Options
 
-| Section     | Option     | Description                                | Example Value           |
-| ----------- | ---------- | ------------------------------------------ | ----------------------- |
-| [AI]        | default_ai | Default service for `/v1/chat/completions` | `gemini`                |
-| [Browser]   | name       | Browser for cookie-based authentication    | `firefox`               |
-| [EnabledAI] | gemini     | Enable/disable Gemini service              | `true`                  |
-| [Proxy]     | http_proxy | Proxy for Gemini connections (optional)    | `http://127.0.0.1:2334` |
+| Section     | Option                | Description                                                | Example Value           |
+| ----------- | --------------------- | ---------------------------------------------------------- | ----------------------- |
+| [AI]        | default_ai            | Default service for `/v1/chat/completions`                 | `gemini`                |
+| [Browser]   | name                  | Browser for cookie-based authentication                    | `firefox`               |
+| [EnabledAI] | gemini                | Enable/disable Gemini service                              | `true`                  |
+| [Proxy]     | http_proxy            | Proxy for Gemini connections (optional)                    | `http://127.0.0.1:2334` |
+| [Server]    | max_upload_size_mb    | Max total upload size per request in MB (`0` to disable)   | `100`                   |
 
 The complete configuration template is available in [`WebAI-to-API/config.conf.example`](WebAI-to-API/config.conf.example).  
 If the cookies are left empty, the application will automatically retrieve them using the default browser specified.
@@ -363,6 +450,13 @@ name = firefox
 # Useful for fixing 403 errors or restricted connections.
 [Proxy]
 http_proxy =
+
+# --- Server Settings ---
+# Max total size (MB) of file uploads per request.
+# Applies to multipart, base64-embedded files, and fetched image_url payloads.
+# Set to 0 to disable the check.
+[Server]
+max_upload_size_mb = 100
 ```
 
 </details>
