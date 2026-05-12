@@ -208,14 +208,22 @@ async def _parse_openai_chat_request(
             if isinstance(sv, str):
                 body["stream"] = sv.lower() in ("1", "true", "yes")
         uploaded: List[FileEntry] = []
-        from app.utils.files import FileBlob
+        from app.utils.files import FileBlob, _looks_like_upload
         for _key, value in form.multi_items():
-            if isinstance(value, UploadFile):
+            if _looks_like_upload(value):
                 try:
                     data = await value.read()
                 finally:
-                    await value.close()
-                uploaded.append(FileBlob(data, value.filename or None))
+                    close = getattr(value, "close", None)
+                    if callable(close):
+                        try:
+                            result = close()
+                            if hasattr(result, "__await__"):
+                                await result
+                        except Exception:
+                            pass
+                filename = getattr(value, "filename", None)
+                uploaded.append(FileBlob(data, filename or None))
                 enforce_total_size(uploaded, max_bytes)
         return body, (uploaded or None)
 
