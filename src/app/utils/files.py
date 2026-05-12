@@ -152,12 +152,37 @@ def resolve_json_files(files: Optional[List[Any]]) -> Optional[List[FileEntry]]:
     return out or None
 
 
-async def _read_upload(u: UploadFile) -> FileBlob:
+def _looks_like_upload(value: Any) -> bool:
+    """Detect a FastAPI/Starlette UploadFile robustly.
+
+    Some FastAPI/Starlette version combos surface an UploadFile subclass
+    that fails ``isinstance(value, UploadFile)`` against the one imported
+    here. Duck-type instead: it's not a plain string, and it has read()
+    plus a filename attribute.
+    """
+    if isinstance(value, str):
+        return False
+    return (
+        hasattr(value, "read")
+        and callable(getattr(value, "read"))
+        and hasattr(value, "filename")
+    )
+
+
+async def _read_upload(u: Any) -> FileBlob:
     try:
         data = await u.read()
     finally:
-        await u.close()
-    return FileBlob(data, u.filename or None)
+        close = getattr(u, "close", None)
+        if callable(close):
+            try:
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception:
+                pass
+    filename = getattr(u, "filename", None)
+    return FileBlob(data, filename or None)
 
 
 def _filename_from_url(url: str, mime: Optional[str], idx: int) -> str:
@@ -338,6 +363,24 @@ async def parse_gemini_call(
     ct = (request.headers.get("content-type") or "").lower()
     if ct.startswith("multipart/form-data"):
         form = await request.form()
+        # Diagnostic: dump form layout once per request so future weirdness
+        # is easy to debug.
+        try:
+            from app.logger import logger as _log
+            _log.debug(
+                "multipart form items: "
+                + ", ".join(
+                    f"{k}={type(v).__name__}"
+                    + (
+                        f"(filename={getattr(v, 'filename', None)!r})"
+                        if not isinstance(v, str)
+                        else ""
+                    )
+                    for k, v in form.multi_items()
+                )
+            )
+        except Exception:
+            pass
         message = form.get("message")
         if not isinstance(message, str) or not message:
             raise HTTPException(status_code=400, detail="'message' form field is required")
@@ -345,7 +388,7 @@ async def parse_gemini_call(
         gem = form.get("gem") or None
         files: List[FileEntry] = []
         for _key, value in form.multi_items():
-            if isinstance(value, UploadFile):
+            if _looks_like_upload(value):
                 files.append(await _read_upload(value))
                 enforce_total_size(files, max_bytes)
         return GeminiCall(
