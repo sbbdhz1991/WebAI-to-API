@@ -1,11 +1,13 @@
 # 核心 Web 框架
 fastapi
 uvicorn
+python-multipart
 
 # 核心功能库 (这是“锚点”，让它自己决定依赖什么)
 gemini-webapi==2.0.0
 
 # 其他必要工具
+httpx
 loguru
 browser-cookie3
 lz4
