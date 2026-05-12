@@ -1,12 +1,23 @@
 # src/app/endpoints/chat.py
 import json
 import time
-from typing import Optional
-from fastapi import APIRouter, HTTPException
+from typing import Any, List, Optional, Tuple
+
+from fastapi import APIRouter, HTTPException, Request, UploadFile
+
 from app.logger import logger
-from schemas.request import GeminiRequest, OpenAIChatRequest
 from app.services.gemini_client import get_gemini_client, GeminiClientNotInitializedError
 from app.services.session_manager import get_translate_session_manager
+from app.utils.files import (
+    FileEntry,
+    check_content_length,
+    enforce_total_size,
+    get_max_upload_size,
+    materialize_files,
+    parse_gemini_call,
+    resolve_json_files,
+    resolve_openai_content_parts,
+)
 
 router = APIRouter()
 
@@ -36,17 +47,22 @@ async def list_gems():
 
 
 @router.post("/translate")
-async def translate_chat(request: GeminiRequest):
+async def translate_chat(request: Request):
     try:
-        gemini_client = get_gemini_client()
+        get_gemini_client()
     except GeminiClientNotInitializedError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
     session_manager = get_translate_session_manager()
     if not session_manager:
         raise HTTPException(status_code=503, detail="Session manager is not initialized.")
+
+    call = await parse_gemini_call(request)
     try:
-        response = await session_manager.get_response(request.model, request.message, request.files, request.gem)
+        async with materialize_files(call.files) as files:
+            response = await session_manager.get_response(
+                call.model, call.message, files, call.gem
+            )
         return {"response": response.text}
     except Exception as e:
         logger.error(f"Error in /translate endpoint: {e}", exc_info=True)
@@ -91,7 +107,7 @@ def _parse_tool_call(text: str) -> Optional[dict]:
 def convert_to_openai_format(response_text: str, model: str, stream: bool = False, tool_call: Optional[dict] = None):
     ts = int(time.time())
     choice_key = "delta" if stream else "message"
-    
+
     if tool_call:
         args = tool_call.get("arguments", {})
         content = {
@@ -155,40 +171,119 @@ async def list_models():
     }
 
 
+async def _parse_openai_chat_request(
+    request: Request,
+    max_bytes: int = 0,
+) -> Tuple[dict, Optional[List[FileEntry]]]:
+    """Parse /v1/chat/completions from either JSON or multipart.
+
+    Multipart contract: `payload` (or `messages`) holds a JSON string
+    matching the regular OpenAIChatRequest body; one or more `files`
+    uploads are appended to whatever files the JSON body already
+    declares.
+    """
+    ct = (request.headers.get("content-type") or "").lower()
+    if ct.startswith("multipart/form-data"):
+        form = await request.form()
+        raw_payload = form.get("payload") or form.get("messages")
+        if isinstance(raw_payload, str):
+            try:
+                body = json.loads(raw_payload)
+            except json.JSONDecodeError as e:
+                raise HTTPException(
+                    status_code=400, detail=f"invalid JSON in 'payload' field: {e}"
+                )
+            if isinstance(body, list):
+                # `messages` field used directly as the messages array
+                body = {"messages": body}
+        else:
+            body = {}
+        # form scalar overrides (handy for curl examples)
+        for k in ("model", "gem"):
+            v = form.get(k)
+            if isinstance(v, str) and v:
+                body[k] = v
+        if "stream" in form:
+            sv = form.get("stream")
+            if isinstance(sv, str):
+                body["stream"] = sv.lower() in ("1", "true", "yes")
+        uploaded: List[FileEntry] = []
+        from app.utils.files import FileBlob
+        for _key, value in form.multi_items():
+            if isinstance(value, UploadFile):
+                try:
+                    data = await value.read()
+                finally:
+                    await value.close()
+                uploaded.append(FileBlob(data, value.filename or None))
+                enforce_total_size(uploaded, max_bytes)
+        return body, (uploaded or None)
+
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid JSON body: {e}")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="request body must be a JSON object")
+    extra_files = resolve_json_files(body.get("files"))
+    enforce_total_size(extra_files, max_bytes)
+    return body, extra_files
+
+
 @router.post("/v1/chat/completions")
-async def chat_completions(request: OpenAIChatRequest):
+async def chat_completions(request: Request):
     try:
         gemini_client = get_gemini_client()
     except GeminiClientNotInitializedError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    is_stream = request.stream if request.stream is not None else False
+    max_bytes = get_max_upload_size()
+    check_content_length(request, max_bytes)
+    body, extra_files = await _parse_openai_chat_request(request, max_bytes)
 
-    if not request.messages:
+    messages: List[dict] = body.get("messages") or []
+    if not messages:
         raise HTTPException(status_code=400, detail="No messages provided.")
 
-    conversation_parts = []
-    
-    # Extract tools prompt
-    tools_prompt = _build_tools_prompt(request.tools) if request.tools else ""
+    model: Optional[str] = body.get("model")
+    stream: bool = bool(body.get("stream"))
+    tools: Optional[List[dict]] = body.get("tools")
+    gem: Optional[Any] = body.get("gem")
 
-    # Merge tools prompt with system message if possible, otherwise prepend it
+    # Pull multimodal parts (image_url / file) out of message content arrays.
+    try:
+        messages, multimodal_files = await resolve_openai_content_parts(messages, max_bytes)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error resolving multimodal content: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"invalid multimodal content: {e}")
+
+    all_files: List[FileEntry] = []
+    if extra_files:
+        all_files.extend(extra_files)
+    all_files.extend(multimodal_files)
+    enforce_total_size(all_files, max_bytes)
+    files_for_call = all_files or None
+
+    conversation_parts: List[str] = []
+
+    tools_prompt = _build_tools_prompt(tools) if tools else ""
+
     system_msg_index = -1
-    for i, msg in enumerate(request.messages):
+    for i, msg in enumerate(messages):
         if msg.get("role") == "system":
             system_msg_index = i
             break
 
     if tools_prompt:
         if system_msg_index != -1:
-            # Append to existing system message
-            orig_content = request.messages[system_msg_index].get("content") or ""
-            request.messages[system_msg_index]["content"] = f"{orig_content}\n\n{tools_prompt}".strip()
+            orig_content = messages[system_msg_index].get("content") or ""
+            messages[system_msg_index]["content"] = f"{orig_content}\n\n{tools_prompt}".strip()
         else:
-            # No system message, add one at the beginning
             conversation_parts.append(tools_prompt)
 
-    for msg in request.messages:
+    for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content") or ""
 
@@ -215,24 +310,27 @@ async def chat_completions(request: OpenAIChatRequest):
 
     final_prompt = "\n\n".join(conversation_parts)
 
-    if not request.model:
+    if not model:
         raise HTTPException(status_code=400, detail="Model not specified in the request.")
 
     try:
-        response = await gemini_client.generate_content(message=final_prompt, model=request.model, files=None, gem=request.gem)
+        async with materialize_files(files_for_call) as files:
+            response = await gemini_client.generate_content(
+                message=final_prompt, model=model, files=files, gem=gem
+            )
         logger.debug(f"Gemini raw response: {response.text!r}")
-        tool_call = _parse_tool_call(response.text) if request.tools else None
+        tool_call = _parse_tool_call(response.text) if tools else None
         logger.debug(f"Parsed tool_call: {tool_call}")
-        
-        openai_response = convert_to_openai_format(response.text, request.model, is_stream, tool_call)
-        
-        if is_stream:
+
+        openai_response = convert_to_openai_format(response.text, model, stream, tool_call)
+
+        if stream:
             from fastapi.responses import StreamingResponse
             async def sse_stream():
                 yield f"data: {json.dumps(openai_response)}\n\n"
                 yield "data: [DONE]\n\n"
             return StreamingResponse(sse_stream(), media_type="text/event-stream")
-            
+
         return openai_response
     except Exception as e:
         logger.error(f"Error in /v1/chat/completions endpoint: {e}", exc_info=True)

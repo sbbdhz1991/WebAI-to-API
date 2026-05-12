@@ -1,6 +1,6 @@
 # src/schemas/request.py
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 class GeminiModels(str, Enum):
@@ -18,10 +18,20 @@ class GeminiModels(str, Enum):
     
 
 
+class FileUpload(BaseModel):
+    """Inline file payload for JSON requests."""
+    filename: Optional[str] = None
+    content_base64: str = Field(description="Raw or data:URL base64 payload.")
+    mime_type: Optional[str] = None
+
+
 class GeminiRequest(BaseModel):
     message: str
     model: str = Field(default="gemini-3-flash", description="Model to use for Gemini.")
-    files: Optional[List[str]] = []
+    files: Optional[List[Union[str, FileUpload]]] = Field(
+        default=None,
+        description="Mix of server-side path strings and base64-encoded file payloads.",
+    )
     gem: Optional[str] = Field(default=None, description="Gem ID or name to use as system prompt.")
 
 class OpenAIChatRequest(BaseModel):
@@ -31,6 +41,10 @@ class OpenAIChatRequest(BaseModel):
     tools: Optional[List[dict]] = None
     tool_choice: Optional[Any] = None
     gem: Optional[str] = Field(default=None, description="Gem ID or name to use as system prompt.")
+    files: Optional[List[Union[str, FileUpload]]] = Field(
+        default=None,
+        description="Optional file payloads applied in addition to any multimodal parts found in messages.",
+    )
 
 class Part(BaseModel):
     text: Optional[str] = None
