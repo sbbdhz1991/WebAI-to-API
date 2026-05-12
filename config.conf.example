@@ -44,3 +44,10 @@ gemini = true
 # Example: http_proxy = http://127.0.0.1:2334
 [Proxy]
 http_proxy =
+
+# --- Server Settings ---
+# Maximum total size (in megabytes) of file uploads per request.
+# Applies to multipart uploads, base64-embedded files, and fetched
+# image_url payloads. Set to 0 to disable the check.
+[Server]
+max_upload_size_mb = 100

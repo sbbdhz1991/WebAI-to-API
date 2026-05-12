@@ -27,6 +27,8 @@ def load_config(config_file: str = "config.conf") -> configparser.ConfigParser:
         config["AI"] = {"default_model_gemini": "gemini-3-flash"}
     if "Proxy" not in config:
         config["Proxy"] = {"http_proxy": ""}
+    if "Server" not in config:
+        config["Server"] = {"max_upload_size_mb": "100"}
 
     # Save changes to the configuration file, also with UTF-8 encoding.
     try:
