@@ -165,6 +165,35 @@ curl "http://localhost:6969/v1/models?key=your-secret-key"
 
 `/gemini`, `/gemini-chat`, `/translate`, and `/v1/chat/completions` all accept file attachments — images, PDFs, video, and audio — in three interchangeable forms. Pick whichever fits your client.
 
+### Prerequisites: full browser cookies
+
+File attachments require **more cookies than the two `__Secure-1PSID*` cookies** used for plain text chat. Google's media upload endpoint demands the SAPISID family (`SAPISID`, `__Secure-1PAPISID`, `__Secure-3PAPISID`, `SID`, `HSID`, `SSID`, `APISID`, and a handful of others). Without these, uploads silently fail with `APIError 1099` or hang until watchdog timeout.
+
+To make uploads work:
+
+1. Sign in at https://gemini.google.com in a regular browser using the same Google account whose cookies you've put in `gemini_cookie_1psid` / `gemini_cookie_1psidts`.
+2. Open DevTools → Network → make one chat message (no attachment needed).
+3. Pick any request to `gemini.google.com/_/BardChatUi/...` → right-click → Copy → Copy as cURL (bash).
+4. Find the `-H 'Cookie: <long string>'` chunk. Copy the **entire string after `Cookie: `** (everything between the single quotes).
+5. Paste it as a one-line value into `config.conf`:
+
+```ini
+[Cookies]
+gemini_cookie_1psid = <kept as before>
+gemini_cookie_1psidts = <kept as before>
+gemini_cookie_extra = SAPISID=...; __Secure-1PAPISID=...; SID=...; HSID=...; SSID=...; APISID=...; __Secure-3PAPISID=...; <…>
+```
+
+6. Restart the server (`docker compose restart` if `config.conf` is volume-mounted, otherwise rebuild). Startup log should show:
+
+```
+Injected N extra cookies into Gemini session.
+```
+
+with `N ≥ 20`.
+
+> ⚠️ **The pasted string is account-password equivalent.** Treat `config.conf` like a secret: `chmod 600`, add to `.gitignore`, never commit/share. Cookies typically last days to weeks before requiring refresh.
+
 ### 1. `multipart/form-data` (recommended for browsers and curl)
 
 Plain form fields plus one or more `files` parts. Filename is preserved, so MIME is inferred correctly.
@@ -242,6 +271,22 @@ curl http://localhost:6969/v1/chat/completions \
 ### Size limit
 
 Total upload size per request is capped by `[Server] max_upload_size_mb` (default **100 MB**, set to `0` to disable). Requests exceeding the limit are rejected with `413 Payload Too Large`. If you front the server with nginx or another proxy, raise its body-size limit accordingly (`client_max_body_size` for nginx).
+
+### Known limitations & troubleshooting
+
+File upload support is built on top of patches that reverse-engineer Google's current Gemini web protocol (see `src/app/services/gemini_patch.py`). The protocol is unofficial and Google changes it without notice, so this layer is inherently fragile.
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Hangs ~2 minutes, log shows `Watchdog … Stream suspended` | Cookies are short / SAPISID family missing | Re-paste full browser `Cookie:` header into `gemini_cookie_extra` |
+| `APIError 1099` | Upload protocol mismatch | Verify patches are loaded (look for `[patch] gemini_webapi.upload_file -> resumable …` at startup); rebuild image if missing |
+| `INVALID_ARGUMENT 400` from `er` frame | Body or header layout mismatch (likely Google changed protocol) | Recapture a working browser request via Fiddler / DevTools HAR and re-diff against `gemini_patch.py` |
+| Model replies "I can't see the video/image" | Cookies are valid but account / region lacks media support | Verify upload works in the browser first; if browser also can't see attachments, the account tier is the limit |
+| `503 Gemini cookies not found` | `config.conf` is missing or empty | Refill cookies and ensure the file is reachable inside the container (mount it as a volume if you don't want to rebuild every time) |
+
+**Diagnostic mode**: set environment variable `WEBAI_DEBUG_DUMP_REQUEST=1` to log the full outgoing StreamGenerate request (URL + headers + body, **including live cookies**) on every attachment call. Use only for one-off debugging — leaving it on writes account-password-equivalent data into the log.
+
+**Cookie rotation**: when Google rotates `__Secure-1PSIDTS`, the library auto-saves the new value back into `config.conf`. But the other cookies in `gemini_cookie_extra` are not refreshed automatically. If uploads start failing weeks after setup, refresh `gemini_cookie_extra` from the browser.
 
 ---
 
