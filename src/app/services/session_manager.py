@@ -16,6 +16,7 @@ class SessionManager:
             # Start a new session if none exists or the model or gem has changed
             if self.session is None or self.model != model or self.gem != gem:
                 if self.session is not None:
+
                     # Closing the session is handled by the library's internal logic
                     pass
                 # If model is an Enum, use its value

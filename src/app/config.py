@@ -23,6 +23,10 @@ def load_config(config_file: str = "config.conf") -> configparser.ConfigParser:
         config["Browser"] = {"name": "chrome"}
     if "Cookies" not in config:
         config["Cookies"] = {}
+    # Extra browser cookies (Cookie-header format) for media uploads.
+    # Empty by default; user pastes when needed.
+    if "gemini_cookie_extra" not in config["Cookies"]:
+        config["Cookies"]["gemini_cookie_extra"] = ""
     if "AI" not in config:
         config["AI"] = {"default_model_gemini": "gemini-3-flash"}
     if "Proxy" not in config:
