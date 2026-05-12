@@ -3,7 +3,11 @@ from models.gemini import MyGeminiClient
 from app.config import CONFIG
 from app.logger import logger
 from app.utils.browser import get_cookie_from_browser
-from app.services.gemini_patch import apply_patches, inject_extra_cookies
+from app.services.gemini_patch import (
+    apply_patches,
+    inject_extra_cookies,
+    install_streamgen_interceptor,
+)
 
 # Import the specific exception to handle it gracefully
 from gemini_webapi.exceptions import AuthError
@@ -63,6 +67,12 @@ async def init_gemini_client() -> bool:
                             )
                     except Exception as ce:
                         logger.warning(f"Failed to inject extra cookies: {ce}")
+                # Install the StreamGenerate body interceptor so attached
+                # files use the 9-element ref shape the server expects.
+                try:
+                    install_streamgen_interceptor(_gemini_client.client)
+                except Exception as ie:
+                    logger.warning(f"Failed to install streamgen interceptor: {ie}")
                 logger.info("Gemini client initialized successfully.")
                 return True
             else:
