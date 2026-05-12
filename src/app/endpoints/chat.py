@@ -315,6 +315,11 @@ async def chat_completions(request: Request):
 
     try:
         async with materialize_files(files_for_call) as files:
+            logger.debug(
+                f"/v1/chat/completions calling generate_content with "
+                f"{len(files) if files else 0} file(s): "
+                f"{[str(p) for p in (files or [])]}"
+            )
             response = await gemini_client.generate_content(
                 message=final_prompt, model=model, files=files, gem=gem
             )

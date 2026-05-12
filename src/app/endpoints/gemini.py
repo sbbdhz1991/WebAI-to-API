@@ -19,6 +19,11 @@ async def gemini_generate(request: Request):
     call = await parse_gemini_call(request)
     try:
         async with materialize_files(call.files) as files:
+            logger.debug(
+                f"/gemini calling generate_content with "
+                f"{len(files) if files else 0} file(s): "
+                f"{[str(p) for p in (files or [])]}"
+            )
             response = await gemini_client.generate_content(
                 call.message, call.model, files=files, gem=call.gem
             )
