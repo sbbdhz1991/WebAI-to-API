@@ -57,6 +57,10 @@ async def upload_file_resumable(
     gemini-webapi keep working after the monkey-patch.
     """
     # Normalize input to (bytes, filename)
+    logger.info(
+        f"[patch] upload_file_resumable invoked: file_type={type(file).__name__}, "
+        f"push_id={push_id!r}, filename_arg={filename!r}"
+    )
     if isinstance(file, (str, Path)):
         p = Path(file)
         if not p.is_file():
@@ -140,11 +144,10 @@ async def upload_file_resumable(
             f"resumable upload finalize: unexpected response body: "
             f"{file_uri[:200]!r}"
         )
-    if verbose:
-        logger.debug(
-            f"resumable upload ok: filename={filename!r} bytes={len(data)} "
-            f"uri={file_uri}"
-        )
+    logger.info(
+        f"[patch] resumable upload OK: filename={filename!r} bytes={len(data)} "
+        f"uri={file_uri}"
+    )
     return file_uri
 
 
@@ -258,5 +261,5 @@ def apply_patches() -> None:
         pass
 
     logger.info(
-        "Patched gemini_webapi.upload_file -> resumable browser-compatible flow"
+        "[patch] gemini_webapi.upload_file -> resumable browser-compatible flow"
     )
