@@ -26,8 +26,10 @@ GEMINI_API_KEY=
 ```
 
 - `ENVIRONMENT=development`: Runs the server in **development** mode with auto-reload and debug logs.
-- Change to `ENVIRONMENT=production` to enable **multi-worker production** mode with detached execution (`make up`).
+- Change to `ENVIRONMENT=production` to run in detached mode (`make up -d`).
 - `GEMINI_API_KEY`: When non-empty, every request must carry the matching key — see [Authentication](README.md#authentication) for accepted header/query forms. Empty (default) means auth is disabled.
+
+> The server runs with `--workers 1` on purpose. Gemini sessions are stateful and each worker maintains its own cookie-rotation loop; running multiple workers causes inconsistent `__Secure-1PSIDTS` state and risks Google rate-limiting. Concurrency is handled by FastAPI's async stack within the single worker.
 
 > **Tip:** If `ENVIRONMENT` is not set, the default is automatically assumed to be `development`.
 
@@ -76,7 +78,17 @@ make up
 Depending on the environment:
 
 - In **development**, the server runs in the foreground with hot-reloading.
-- In **production**, the server runs in **detached mode** (`-d`) with multiple workers.
+- In **production**, the server runs in **detached mode** (`-d`) with a single worker (see note above).
+
+> **Before first launch**, create the persistent cookie-cache directory so the rotated `__Secure-1PSIDTS` survives container restarts:
+>
+> ```bash
+> mkdir -p ./data/gemini_cache
+> ```
+>
+> `docker-compose.yml` mounts `./data` into the container at `/app/data` and sets `GEMINI_COOKIE_PATH=/app/data/gemini_cache`. Without this directory, every restart falls back to the (often-expired) `__Secure-1PSIDTS` in `config.conf` and produces `AuthError`. See the [Cookie rotation](README.md#cookie-rotation) section for the full picture.
+>
+> `config.conf` is also bind-mounted from the host, so you can edit cookies without rebuilding the image.
 
 #### ⏹ Stop the server
 
@@ -101,9 +113,11 @@ Key files:
 ```plaintext
 .
 ├── Dockerfile              # Base image and command logic
-├── docker-compose.yml      # Shared config (network, ports, env)
+├── docker-compose.yml      # Shared config (network, ports, env, volumes)
 ├── .env                    # Defines ENVIRONMENT (development/production)
 ├── Makefile                # Simplifies Docker CLI usage
+├── config.conf             # Bind-mounted into the container (cookies, proxy, etc.)
+└── data/gemini_cache/      # Bind-mounted; holds the rotated 1PSIDTS cache
 ```
 
 ---
@@ -111,4 +125,5 @@ Key files:
 ### ✅ Best Practices
 
 - Don't use `ENVIRONMENT=development` in **production**.
-- Avoid bind mounts (`volumes`) in production to ensure image consistency.
+- Keep the `./data` and `./config.conf` bind mounts — they are required for cookie persistence across restarts. Image consistency is preserved because application code is still baked into the image; only state (cookies/cache) is mounted.
+- Stick to `--workers 1`. See the note in [Environment Configuration](#%EF%B8%8F-docker-environment-configuration).

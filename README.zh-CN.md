@@ -290,7 +290,13 @@ curl http://localhost:6969/v1/chat/completions \
 
 **调试模式**：设置环境变量 `WEBAI_DEBUG_DUMP_REQUEST=1` 可以把每次带附件请求的完整 StreamGenerate 出站请求（URL + Header + Body，**包括实时 Cookie**）打到日志。仅用于一次性排错，长开会把账号密码级别的数据写进日志。
 
-**Cookie 轮换**：Google 会自动轮换 `__Secure-1PSIDTS`，库会自动把新值写回 `config.conf`，但 `gemini_cookie_extra` 中的其他 Cookie **不会自动刷新**。如果用了几周后上传开始失败，请从浏览器重新刷新 `gemini_cookie_extra`。
+**Cookie 轮换**：Google 每隔几分钟会轮换一次 `__Secure-1PSIDTS`。`gemini-webapi` 默认开启 `auto_refresh=True`（间隔 600 秒），会在后台调用 Google 的 rotate 端点，更新内存中的 cookie，并把新值写入缓存文件 `$GEMINI_COOKIE_PATH/.cached_cookies_<PSID>.json`。下次 `init()` 时库会**优先**读这个缓存而不是 `config.conf` 中的值，所以即使进程重启也能继续用最新的会话。
+
+`src/run.py` 已经把 `GEMINI_COOKIE_PATH` 默认指向 `./data/gemini_cache/`，让缓存落在项目目录内，而不是系统临时目录（容易被清理）。Docker 部署同样在 `docker-compose.yml` 里设了这个环境变量，并把 `./data` 挂载为 volume —— **没有这个挂载**，容器每次重启都会丢失轮换后的 cookie，只能用 `config.conf` 里那条早已作废的初始值，从而触发 `AuthError`。
+
+注意：自动轮换只覆盖 `__Secure-1PSIDTS`。`gemini_cookie_extra` 中的其它 Cookie **不会自动刷新**。如果用了几周后上传开始失败，请从浏览器重新粘贴 `gemini_cookie_extra`。
+
+**Worker 数量**：请使用 `--workers 1`。每个 uvicorn worker 持有独立的 Gemini 会话和独立的 cookie 轮换循环，多 worker 会导致各进程之间的 `1PSIDTS` 状态不一致，并可能因为重复请求 rotate 端点而被 Google 限流。单 worker 下 FastAPI 的 async 协程足以承载并发请求。
 
 **长视频 / 长响应超时**：gemini-webapi 的 stream 看门狗默认 120 秒。对于较大视频（几十 MB）Google 流式响应可能需要更久，可用 `WEBAI_WATCHDOG_TIMEOUT` 调高：
 

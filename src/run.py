@@ -16,6 +16,17 @@ import sys
 import threading
 import os
 import signal
+
+# Persist gemini-webapi's rotated 1PSIDTS cache next to the project so it
+# survives restarts. Without this, the library defaults to the OS temp dir,
+# which is wiped on container restart and can be cleaned on the host.
+_default_cookie_cache = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data",
+    "gemini_cache",
+)
+os.environ.setdefault("GEMINI_COOKIE_PATH", _default_cookie_cache)
+os.makedirs(os.environ["GEMINI_COOKIE_PATH"], exist_ok=True)
 from typing import Dict, Union, Tuple
 from fastapi.routing import APIRoute
 from typing import TYPE_CHECKING
