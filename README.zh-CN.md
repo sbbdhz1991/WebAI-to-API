@@ -168,34 +168,35 @@ docker run -e GEMINI_API_KEY="your-secret-key" -p 6969:6969 webai-to-api
 
 `/gemini`、`/gemini-chat`、`/translate`、`/v1/chat/completions` 四个端点都支持文件附件 —— 图片、PDF、视频、音频，提供三种可互换的传入形式，按客户端方便选择即可。
 
-### 前提：完整的浏览器 Cookie
+### 前提：Cookie 配置
 
-文件上传**所需的 Cookie 比纯文本对话多得多**。纯文本只需要 `__Secure-1PSID*` 两个 Cookie，但 Google 的媒体上传端点要求 SAPISID 全家族（`SAPISID`、`__Secure-1PAPISID`、`__Secure-3PAPISID`、`SID`、`HSID`、`SSID`、`APISID` 等十余个）。**缺失这些 Cookie 会导致上传静默失败，报 `APIError 1099` 或卡到看门狗超时。**
-
-要让上传可用，步骤如下：
-
-1. 在常规浏览器中用与 `gemini_cookie_1psid` / `gemini_cookie_1psidts` 同一个 Google 账号登录 https://gemini.google.com 。
-2. 打开开发者工具 → Network → 任意发送一条聊天消息（不需要带附件）。
-3. 找一个发往 `gemini.google.com/_/BardChatUi/...` 的请求 → 右键 → Copy → Copy as cURL (bash)。
-4. 找到其中的 `-H 'Cookie: <长字符串>'`，复制单引号之间 **`Cookie: ` 后面的整段字符串**。
-5. 粘贴为 `config.conf` 中的一行：
+文件上传通常**只需要和纯文本对话一样的两个 Cookie**：
 
 ```ini
 [Cookies]
-gemini_cookie_1psid = <保持不变>
-gemini_cookie_1psidts = <保持不变>
+gemini_cookie_1psid = <__Secure-1PSID 值>
+gemini_cookie_1psidts = <__Secure-1PSIDTS 值>
+```
+
+`gemini-webapi` 在 `init()` 时会用这两个 Cookie 自动从 `gemini.google.com` bootstrap 拉到媒体上传所需的 SAPISID 系 Cookie（`SAPISID`、`__Secure-1PAPISID`、`__Secure-3PAPISID` 等），不需要手动配置。
+
+#### 兜底选项：`gemini_cookie_extra`（一般用不到）
+
+只有当 bootstrap 拉取的 Cookie 不全、上传出现 `APIError 1099` 或卡到看门狗超时时，才需要手动补一份完整的浏览器 Cookie 作为兜底。配置方法：
+
+1. 在常规浏览器中用与 `gemini_cookie_1psid` 同一个 Google 账号登录 https://gemini.google.com 。
+2. 打开开发者工具 → Network → 任意发送一条聊天消息。
+3. 找一个发往 `gemini.google.com/_/BardChatUi/...` 的请求 → 右键 → Copy → Copy as cURL (bash)。
+4. 找到其中的 `-H 'Cookie: <长字符串>'`，复制单引号之间 **`Cookie: ` 后面的整段字符串**。
+5. 粘贴为 `config.conf` 的一行：
+
+```ini
 gemini_cookie_extra = SAPISID=...; __Secure-1PAPISID=...; SID=...; HSID=...; SSID=...; APISID=...; __Secure-3PAPISID=...; <…>
 ```
 
-6. 重启服务器（如果 `config.conf` 是 volume 挂载，`docker compose restart` 即可；否则重新构建镜像）。启动日志应出现：
+6. 重启服务器后启动日志会出现 `Injected N extra cookies into Gemini session.`。
 
-```
-Injected N extra cookies into Gemini session.
-```
-
-其中 `N ≥ 20` 表示注入成功。
-
-> ⚠️ **粘贴的字符串等同于账号密码。** 请像对待密钥一样对待 `config.conf`：`chmod 600`、加入 `.gitignore`、绝不要提交或分享。Cookie 通常能用数天到数周才需要刷新。
+> ⚠️ **`gemini_cookie_extra` 中的字符串等同于账号密码。** 请像对待密钥一样对待 `config.conf`：`chmod 600`、加入 `.gitignore`、绝不要提交或分享。Cookie 通常能用数天到数周才需要刷新。
 
 ### 1. `multipart/form-data`（浏览器和 curl 推荐）
 

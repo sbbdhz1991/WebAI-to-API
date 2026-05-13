@@ -167,34 +167,35 @@ curl "http://localhost:6969/v1/models?key=your-secret-key"
 
 `/gemini`, `/gemini-chat`, `/translate`, and `/v1/chat/completions` all accept file attachments — images, PDFs, video, and audio — in three interchangeable forms. Pick whichever fits your client.
 
-### Prerequisites: full browser cookies
+### Prerequisites: cookie setup
 
-File attachments require **more cookies than the two `__Secure-1PSID*` cookies** used for plain text chat. Google's media upload endpoint demands the SAPISID family (`SAPISID`, `__Secure-1PAPISID`, `__Secure-3PAPISID`, `SID`, `HSID`, `SSID`, `APISID`, and a handful of others). Without these, uploads silently fail with `APIError 1099` or hang until watchdog timeout.
+File uploads usually need **the same two cookies as plain text chat** — nothing more:
 
-To make uploads work:
+```ini
+[Cookies]
+gemini_cookie_1psid = <__Secure-1PSID value>
+gemini_cookie_1psidts = <__Secure-1PSIDTS value>
+```
 
-1. Sign in at https://gemini.google.com in a regular browser using the same Google account whose cookies you've put in `gemini_cookie_1psid` / `gemini_cookie_1psidts`.
-2. Open DevTools → Network → make one chat message (no attachment needed).
+During `init()`, `gemini-webapi` uses these two cookies to bootstrap from `gemini.google.com` and automatically picks up the SAPISID-family cookies (`SAPISID`, `__Secure-1PAPISID`, `__Secure-3PAPISID`, etc.) that the media upload endpoint requires. You don't normally have to set them by hand.
+
+#### Fallback: `gemini_cookie_extra` (rarely needed)
+
+Only if the bootstrap doesn't pick up a full cookie set — symptoms are `APIError 1099` or watchdog timeouts on upload — do you need to paste a full browser `Cookie:` header as a fallback:
+
+1. Sign in at https://gemini.google.com in a regular browser using the same Google account whose `__Secure-1PSID` you've configured.
+2. Open DevTools → Network → make one chat message.
 3. Pick any request to `gemini.google.com/_/BardChatUi/...` → right-click → Copy → Copy as cURL (bash).
 4. Find the `-H 'Cookie: <long string>'` chunk. Copy the **entire string after `Cookie: `** (everything between the single quotes).
 5. Paste it as a one-line value into `config.conf`:
 
 ```ini
-[Cookies]
-gemini_cookie_1psid = <kept as before>
-gemini_cookie_1psidts = <kept as before>
 gemini_cookie_extra = SAPISID=...; __Secure-1PAPISID=...; SID=...; HSID=...; SSID=...; APISID=...; __Secure-3PAPISID=...; <…>
 ```
 
-6. Restart the server (`docker compose restart` if `config.conf` is volume-mounted, otherwise rebuild). Startup log should show:
+6. Restart the server. Startup log should show `Injected N extra cookies into Gemini session.`.
 
-```
-Injected N extra cookies into Gemini session.
-```
-
-with `N ≥ 20`.
-
-> ⚠️ **The pasted string is account-password equivalent.** Treat `config.conf` like a secret: `chmod 600`, add to `.gitignore`, never commit/share. Cookies typically last days to weeks before requiring refresh.
+> ⚠️ **The `gemini_cookie_extra` string is account-password equivalent.** Treat `config.conf` like a secret: `chmod 600`, add to `.gitignore`, never commit/share. Cookies typically last days to weeks before requiring refresh.
 
 ### 1. `multipart/form-data` (recommended for browsers and curl)
 
