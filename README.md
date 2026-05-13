@@ -289,7 +289,13 @@ File upload support is built on top of patches that reverse-engineer Google's cu
 
 **Diagnostic mode**: set environment variable `WEBAI_DEBUG_DUMP_REQUEST=1` to log the full outgoing StreamGenerate request (URL + headers + body, **including live cookies**) on every attachment call. Use only for one-off debugging — leaving it on writes account-password-equivalent data into the log.
 
-**Cookie rotation**: when Google rotates `__Secure-1PSIDTS`, the library auto-saves the new value back into `config.conf`. But the other cookies in `gemini_cookie_extra` are not refreshed automatically. If uploads start failing weeks after setup, refresh `gemini_cookie_extra` from the browser.
+**Cookie rotation**: Google rotates `__Secure-1PSIDTS` every few minutes. `gemini-webapi` runs a background task (`auto_refresh=True`, default 600s interval) that hits Google's rotate endpoint, updates the in-memory cookie, and writes the rotated value to a JSON cache file at `$GEMINI_COOKIE_PATH/.cached_cookies_<PSID>.json`. On the next `init()` the library prefers this cache over the value in `config.conf`, so the session survives restarts.
+
+`src/run.py` defaults `GEMINI_COOKIE_PATH` to `./data/gemini_cache/` so the cache lives next to the project instead of in the OS temp dir (which can be wiped). For Docker, the same path is wired through `docker-compose.yml` and the `./data` directory is mounted as a volume — without that mount, every container restart loses the rotated cookies and falls back to the (now stale) value baked into `config.conf`, producing `AuthError`.
+
+Note: only `__Secure-1PSIDTS` is auto-rotated. The other cookies in `gemini_cookie_extra` are not refreshed automatically. If uploads start failing weeks after setup, refresh `gemini_cookie_extra` from the browser.
+
+**Workers**: run with `--workers 1`. Each uvicorn worker keeps its own in-memory Gemini session and its own rotation loop; multiple workers cause inconsistent `1PSIDTS` state across workers and risk Google rate-limiting the rotation endpoint. FastAPI's async stack already handles concurrent requests within a single worker.
 
 **Long video / long response timeout**: gemini-webapi's stream watchdog defaults to 120 seconds. For large videos (tens of MB) where Google's response can take longer to stream out, set `WEBAI_WATCHDOG_TIMEOUT` to override:
 
