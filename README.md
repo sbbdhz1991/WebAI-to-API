@@ -7,6 +7,8 @@
 
 # WebAI-to-API
 
+**English** | [简体中文](./README.zh-CN.md)
+
 <p align="center">
   <img src="./assets/Server-Run-WebAI.png" alt="WebAI-to-API Server" height="160" />
   <img src="./assets/Server-Run-G4F.png" alt="gpt4free Server" height="160" />
@@ -532,30 +534,40 @@ The project now follows a modular layout that separates configuration, business 
 
 ```plaintext
 src/
+├── run.py                         # Entry point to run the server.
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                # FastAPI app creation, configuration, and lifespan management.
-│   ├── config.py              # Global configuration loader/updater.
-│   ├── logger.py              # Centralized logging configuration.
-│   ├── endpoints/             # API endpoint routers.
-│   │   ├── __init__.py
-│   │   ├── gemini.py          # Endpoints for Gemini (e.g., /gemini, /gemini-chat).
-│   │   ├── chat.py            # Endpoints for translation and OpenAI-compatible requests.
-│   │   └── google_generative.py  # Google Generative AI v1beta API endpoints.
-│   ├── services/              # Business logic and service wrappers.
-│   │   ├── __init__.py
-│   │   ├── gemini_client.py   # Gemini client initialization, content generation, and cleanup.
-│   │   └── session_manager.py # Session management for chat and translation.
-│   └── utils/                 # Helper functions.
-│       ├── __init__.py
-│       └── browser.py         # Browser-based cookie retrieval.
-├── models/                    # Models and wrappers (e.g., MyGeminiClient).
+│   ├── main.py                    # FastAPI app creation, configuration, and lifespan management.
+│   ├── config.py                  # Global configuration loader/updater.
+│   ├── logger.py                  # Centralized logging configuration.
+│   ├── auth.py                    # 🆕 GEMINI_API_KEY auth (Bearer / x-goog-api-key / x-api-key / ?key=).
+│   ├── endpoints/                 # API endpoint routers.
+│   │   ├── gemini.py              # Endpoints for Gemini (/gemini, /gemini-chat).
+│   │   ├── chat.py                # /translate and OpenAI-compatible /v1/chat/completions.
+│   │   └── google_generative.py   # Google Generative AI v1beta API (/v1beta/models/*).
+│   ├── services/                  # Business logic and service wrappers.
+│   │   ├── gemini_client.py       # Gemini client initialization, content generation, and cleanup.
+│   │   ├── gemini_patch.py        # 🆕 Reverse-engineered monkey-patches that fix
+│   │   │                          #     gemini-webapi's incompatibility with Google's
+│   │   │                          #     current upload + StreamGenerate protocol;
+│   │   │                          #     required for file uploads to work.
+│   │   └── session_manager.py     # Session management for chat and translation.
+│   └── utils/                     # Helper functions.
+│       ├── browser.py             # Browser-based cookie retrieval.
+│       └── files.py               # 🆕 File-input normalization: wraps byte payloads as
+│                                  #     named FileBlobs and materializes them to a temp
+│                                  #     dir so mimetypes can identify the MIME type
+│                                  #     (avoids octet-stream rejection from Google).
+├── models/                        # Models and wrappers (e.g., MyGeminiClient).
 │   └── gemini.py
-├── schemas/                   # Pydantic schemas for request/response validation.
-│   └── request.py
-├── config.conf                # Application configuration file.
-└── run.py                     # Entry point to run the server.
+└── schemas/                       # Pydantic schemas for request/response validation.
+    └── request.py
+
+config.conf                         # Application configuration (at project root).
 ```
+
+> 🆕 marks files added in this fork (not present in upstream): they implement API-key
+> authentication, the upload-protocol patches, and file-input normalization respectively.
 
 ---
 
@@ -568,9 +580,11 @@ The project is built on a modular architecture designed for scalability and ease
 - **app/main.py:** Initializes the FastAPI application, configures middleware, and manages application lifespan (startup and shutdown routines).
 - **app/config.py:** Handles the loading and updating of configuration settings from `config.conf`.
 - **app/logger.py:** Sets up a centralized logging system.
-- **app/endpoints/:** Contains separate modules for handling API endpoints. Each module (e.g., `gemini.py` and `chat.py`) manages routes specific to their functionality.
-- **app/services/:** Encapsulates business logic, including the Gemini client wrapper (`gemini_client.py`) and session management (`session_manager.py`).
+- **app/auth.py:** Implements the optional `GEMINI_API_KEY` gate across all supported header/query forms.
+- **app/endpoints/:** Contains separate modules for handling API endpoints. Each module (`gemini.py`, `chat.py`, `google_generative.py`) manages routes specific to its functionality.
+- **app/services/:** Encapsulates business logic — the Gemini client wrapper (`gemini_client.py`), session management (`session_manager.py`), and the upload-protocol monkey-patches (`gemini_patch.py`) that make file attachments work against Google's current backend.
 - **app/utils/browser.py:** Provides helper functions, such as retrieving cookies from the browser for authentication.
+- **app/utils/files.py:** Normalizes file inputs (multipart, base64, `image_url`) into named blobs that the Gemini client uploads with correct MIME types.
 - **models/:** Holds model definitions like `MyGeminiClient` for interfacing with the Gemini Web API.
 - **schemas/:** Defines Pydantic models for validating API requests.
 
