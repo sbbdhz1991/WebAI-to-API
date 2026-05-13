@@ -134,6 +134,14 @@ _DEBUG_DUMP_REQUEST = os.environ.get("WEBAI_DEBUG_DUMP_REQUEST", "").lower() in 
     "1", "true", "yes", "on"
 )
 
+# Override the library's stream-idle watchdog timeout. Default in
+# gemini-webapi 2.0.0 is 120s. For long-running media analyses the stream
+# may pause longer than 120s; bumping this gives Google more time to send
+# the trailing frame. Set to 0 to keep library default.
+_WATCHDOG_TIMEOUT_SECONDS = int(
+    os.environ.get("WEBAI_WATCHDOG_TIMEOUT", "0") or "0"
+)
+
 _UPLOAD_INIT_URL = "https://push.clients6.google.com/upload/"
 _TENANT_ID = "bard-storage"
 _ORIGIN = "https://gemini.google.com"
@@ -791,6 +799,61 @@ def install_streamgen_interceptor(client_wrapper: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _patch_watchdog_timeout() -> None:
+    """Bump gemini-webapi's stream-idle watchdog if env var is set.
+
+    The library hardcodes 120 seconds in ``_generate``. There's no public
+    setter, so we walk the module looking for a likely constant or rebind
+    a class attribute. If we can't find a clean override point, fall back
+    to a no-op (user has to live with 120s).
+    """
+    if _WATCHDOG_TIMEOUT_SECONDS <= 0:
+        return
+    try:
+        import gemini_webapi.client as _client_mod
+    except ImportError:
+        return
+
+    # The constant is typically a module- or class-level int. Scan for
+    # likely names.
+    candidates = [
+        "WATCHDOG_TIMEOUT",
+        "WATCHDOG_IDLE_TIMEOUT",
+        "_WATCHDOG_TIMEOUT",
+        "STREAM_IDLE_TIMEOUT",
+        "IDLE_TIMEOUT",
+    ]
+    patched = []
+    for name in candidates:
+        if hasattr(_client_mod, name):
+            try:
+                setattr(_client_mod, name, _WATCHDOG_TIMEOUT_SECONDS)
+                patched.append(f"module.{name}")
+            except Exception:
+                pass
+    # Also poke the GeminiClient class.
+    GeminiClient = getattr(_client_mod, "GeminiClient", None)
+    if GeminiClient is not None:
+        for name in candidates:
+            if hasattr(GeminiClient, name):
+                try:
+                    setattr(GeminiClient, name, _WATCHDOG_TIMEOUT_SECONDS)
+                    patched.append(f"GeminiClient.{name}")
+                except Exception:
+                    pass
+    if patched:
+        logger.info(
+            f"[patch] watchdog timeout overridden to "
+            f"{_WATCHDOG_TIMEOUT_SECONDS}s on: {patched}"
+        )
+    else:
+        logger.warning(
+            f"[patch] WEBAI_WATCHDOG_TIMEOUT={_WATCHDOG_TIMEOUT_SECONDS} "
+            "but no watchdog constant found in gemini_webapi.client. "
+            "Library default 120s remains in effect."
+        )
+
+
 def apply_patches() -> None:
     """Install our resumable upload_file in place of gemini_webapi's."""
     try:
@@ -816,6 +879,8 @@ def apply_patches() -> None:
             _client_mod.upload_file = upload_file_resumable  # type: ignore[attr-defined]
     except ImportError:
         pass
+
+    _patch_watchdog_timeout()
 
     logger.info(
         "[patch] gemini_webapi.upload_file -> resumable browser-compatible flow"

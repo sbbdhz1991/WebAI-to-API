@@ -288,6 +288,24 @@ File upload support is built on top of patches that reverse-engineer Google's cu
 
 **Cookie rotation**: when Google rotates `__Secure-1PSIDTS`, the library auto-saves the new value back into `config.conf`. But the other cookies in `gemini_cookie_extra` are not refreshed automatically. If uploads start failing weeks after setup, refresh `gemini_cookie_extra` from the browser.
 
+**Long video / long response timeout**: gemini-webapi's stream watchdog defaults to 120 seconds. For large videos (tens of MB) where Google's response can take longer to stream out, set `WEBAI_WATCHDOG_TIMEOUT` to override:
+
+```yaml
+# docker-compose.yml
+services:
+  webai:
+    environment:
+      - WEBAI_WATCHDOG_TIMEOUT=600   # 10 minutes; recommended when handling video
+```
+
+Or in `.env`:
+
+```
+WEBAI_WATCHDOG_TIMEOUT=600
+```
+
+Symptoms that mean you need this: ``[Watchdog] Connection idle for 120s … Stream suspended`` with a partial ``parse_response_by_frame: Incomplete frame …`` log line right before. Recommended values: ``120`` (default, text-only), ``240`` (occasional images), ``600`` (video work), ``900`` (very large videos with detailed analyses).
+
 ---
 
 ## Usage
