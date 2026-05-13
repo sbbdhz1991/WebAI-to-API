@@ -4,7 +4,10 @@ import os
 from typing import Optional, List, Union
 from pathlib import Path
 from gemini_webapi import GeminiClient as WebGeminiClient
-from gemini_webapi.utils.rotate_1psidts import save_cookies as _gwa_save_cookies
+from gemini_webapi.utils.rotate_1psidts import (
+    save_cookies as _gwa_save_cookies,
+    _get_cookies_cache_path as _gwa_cache_path,
+)
 from app.config import CONFIG
 
 logger = logging.getLogger("app")
@@ -38,7 +41,12 @@ class MyGeminiClient:
         # auto_refresh sleeps 600s before its first write, and only writes on
         # successful rotation. Without this, the cache file stays empty for
         # the first 10 minutes and a fast restart has nothing to load from.
+        # Skip if a cache already exists so a fresh worker can't overwrite a
+        # newer rotation written by a sibling worker (matters under --workers>1).
         try:
+            path = _gwa_cache_path(self.client._cookies)
+            if path and path.exists() and path.stat().st_size > 0:
+                return
             _gwa_save_cookies(self.client._cookies, self.client.verbose)
         except Exception as e:
             logger.warning(f"Failed to seed gemini cookie cache: {e}")
