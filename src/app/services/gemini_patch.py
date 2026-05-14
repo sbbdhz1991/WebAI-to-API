@@ -854,6 +854,155 @@ def _patch_watchdog_timeout() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# rotate_1psidts: Chrome-backed replacement
+# ---------------------------------------------------------------------------
+#
+# Google deprecated the old single-shot /RotateCookies flow that gemini-webapi
+# 2.0.0 implements: today, refreshing __Secure-1PSIDTS requires a signed
+# Device-Bound Session Credentials (DBSC) assertion using an ES256 key whose
+# private half lives in the browser's TPM/secure storage. A headless server
+# can't produce that signature.
+#
+# Workaround: an out-of-process Chromium (the ``chrome_server`` sidecar) holds
+# the real session and rotates PSIDTS on its own schedule. Whenever the
+# library's auto_refresh loop calls ``rotate_1psidts``, we ignore Google
+# entirely and instead pull the current cookies straight out of Chromium via
+# CDP, then graft them onto the curl_cffi session jar.
+#
+# Failure mode: if the Chromium sidecar is unreachable or hasn't been logged
+# in, we return the jar's current PSIDTS so the lib's auto_refresh task
+# doesn't crash. The next cycle (~9 min later) will try again.
+
+
+async def _chrome_rotate_1psidts(client: Any, verbose: bool = False) -> Optional[str]:
+    """Replacement for ``gemini_webapi.utils.rotate_1psidts.rotate_1psidts``.
+
+    Pulls fresh cookies from the chrome_server sidecar via CDP and merges
+    them into the curl_cffi session's cookie jar. Returns the new value of
+    ``__Secure-1PSIDTS`` (or the current jar value on bridge failure).
+    """
+    # Imports are lazy so this module stays importable when gemini-webapi
+    # or the bridge module aren't installed (e.g., local dev / tests).
+    try:
+        from app.services.chrome_bridge import (
+            fetch_gemini_cookies,
+            ChromeBridgeError,
+        )
+    except ImportError as e:
+        logger.error(f"[patch] chrome_bridge unavailable: {e}")
+        return _read_psidts_from_jar(client)
+
+    try:
+        from gemini_webapi.utils.rotate_1psidts import save_cookies as _save_cookies
+    except ImportError:
+        _save_cookies = None  # type: ignore[assignment]
+
+    try:
+        fresh = await fetch_gemini_cookies()
+    except ChromeBridgeError as e:
+        logger.warning(
+            f"[patch] rotate via Chrome failed: {e}. Returning current PSIDTS."
+        )
+        return _read_psidts_from_jar(client)
+
+    # Merge fresh cookies into the live session jar. curl_cffi's Cookies
+    # object exposes a few different setter APIs depending on version; try
+    # them in order.
+    jar = getattr(client, "cookies", None)
+    if jar is None:
+        logger.warning("[patch] client has no cookies attribute; cannot merge")
+        return fresh.get("__Secure-1PSIDTS")
+
+    merged = 0
+    for name, value in fresh.items():
+        if _set_cookie_in_jar(jar, name, value):
+            merged += 1
+
+    # Persist to the lib's on-disk cache (consistent with original behavior).
+    if _save_cookies is not None:
+        try:
+            _save_cookies(jar, verbose)
+        except Exception as e:
+            logger.debug(f"[patch] save_cookies failed (non-fatal): {e}")
+
+    new_psidts = fresh.get("__Secure-1PSIDTS")
+    if verbose:
+        suffix = new_psidts[:30] + "..." if new_psidts else "<missing>"
+        logger.info(
+            f"[patch] rotated via Chrome: merged={merged}, PSIDTS={suffix}"
+        )
+    return new_psidts
+
+
+def _read_psidts_from_jar(client: Any) -> Optional[str]:
+    """Best-effort extraction of the current __Secure-1PSIDTS from a session."""
+    try:
+        jar = getattr(client, "cookies", None)
+        if jar is None:
+            return None
+        # curl_cffi's Cookies object iterates as a CookieJar.
+        for cookie in getattr(jar, "jar", []):
+            if getattr(cookie, "name", None) == "__Secure-1PSIDTS":
+                return cookie.value
+        # Fallback: dict-like access.
+        try:
+            return jar.get("__Secure-1PSIDTS")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return None
+
+
+def _set_cookie_in_jar(jar: Any, name: str, value: str) -> bool:
+    """Try every known curl_cffi Cookies API to set a cookie. Return success."""
+    for setter in (
+        lambda: jar.set(name, value, domain=".google.com"),
+        lambda: jar.set(name, value),
+        lambda: jar.update({name: value}),
+        lambda: jar.__setitem__(name, value),
+    ):
+        try:
+            setter()
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _patch_rotate_1psidts_use_chrome() -> None:
+    """Replace gemini-webapi's rotate_1psidts with the Chrome-backed coroutine.
+
+    The library imports the symbol two places we need to cover, plus the
+    utils package may re-export it. Rebind everywhere to defeat from-import
+    aliasing.
+    """
+    try:
+        import gemini_webapi.utils.rotate_1psidts as _rot_mod
+    except ImportError:
+        logger.warning("[patch] gemini_webapi.utils.rotate_1psidts missing; skip")
+        return
+
+    _rot_mod.rotate_1psidts = _chrome_rotate_1psidts  # type: ignore[attr-defined]
+
+    try:
+        import gemini_webapi.utils as _utils_pkg
+        if hasattr(_utils_pkg, "rotate_1psidts"):
+            _utils_pkg.rotate_1psidts = _chrome_rotate_1psidts  # type: ignore[attr-defined]
+    except ImportError:
+        pass
+
+    try:
+        import gemini_webapi.client as _client_mod
+        if hasattr(_client_mod, "rotate_1psidts"):
+            _client_mod.rotate_1psidts = _chrome_rotate_1psidts  # type: ignore[attr-defined]
+    except ImportError:
+        pass
+
+    logger.info("[patch] rotate_1psidts -> chrome_bridge.fetch_gemini_cookies")
+
+
 def apply_patches() -> None:
     """Install our resumable upload_file in place of gemini_webapi's."""
     try:
@@ -881,6 +1030,7 @@ def apply_patches() -> None:
         pass
 
     _patch_watchdog_timeout()
+    _patch_rotate_1psidts_use_chrome()
 
     logger.info(
         "[patch] gemini_webapi.upload_file -> resumable browser-compatible flow"

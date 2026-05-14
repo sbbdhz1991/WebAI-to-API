@@ -4,6 +4,7 @@ import os
 from typing import Optional, List, Union
 from pathlib import Path
 from gemini_webapi import GeminiClient as WebGeminiClient
+from gemini_webapi.exceptions import AuthError, APIError
 from gemini_webapi.utils.rotate_1psidts import (
     save_cookies as _gwa_save_cookies,
     _get_cookies_cache_path as _gwa_cache_path,
@@ -11,6 +12,28 @@ from gemini_webapi.utils.rotate_1psidts import (
 from app.config import CONFIG
 
 logger = logging.getLogger("app")
+
+
+# Error patterns that look like "your cookies just went stale" — these are
+# what trigger the retry-with-refresh path in generate_content. We're
+# conservative on purpose: retrying on every error would mask real bugs
+# (model errors, content-safety rejections, rate limits, etc.).
+_COOKIE_ERROR_NEEDLES = (
+    "UNAUTHENTICATED",
+    # APIError 1100 has been seen when PSIDCC slips past its 10-minute
+    # server-side TTL between the lib's 9-minute rotation cycles.
+    "1100",
+)
+
+
+def _is_cookie_shaped_failure(exc: BaseException) -> bool:
+    """Return True if exc looks like a cookie-staleness symptom worth retrying."""
+    if isinstance(exc, AuthError):
+        return True
+    if isinstance(exc, APIError):
+        msg = str(exc)
+        return any(needle in msg for needle in _COOKIE_ERROR_NEEDLES)
+    return False
 
 # Maps user-facing short names to the internal model identifiers accepted by gemini-webapi.
 MODEL_ALIASES = {
@@ -84,10 +107,52 @@ class MyGeminiClient:
     ):
         """
         Generate content using the Gemini client.
+
+        Two-layer freshness guarantee against PSIDCC's 10-minute server TTL
+        (which is shorter than gemini-webapi's 9-minute auto_refresh):
+          1. Pre-request: graft the latest cookies from chrome_server into
+             the curl_cffi session, so a stale-on-edge PSIDCC can never be
+             sent on a real request.
+          2. Failure-retry: if Google still returns a cookie-shaped error
+             (AuthError, or APIError 1100 / UNAUTHENTICATED), refresh
+             cookies once more and retry the call exactly once.
         """
         resolved_model = resolve_model_name(model)
         resolved_gem = await self._resolve_gem(gem) if gem else None
-        return await self.client.generate_content(message, model=resolved_model, files=files, gem=resolved_gem)
+
+        await self._prewarm_cookies()
+
+        try:
+            return await self.client.generate_content(
+                message, model=resolved_model, files=files, gem=resolved_gem
+            )
+        except Exception as e:
+            if not _is_cookie_shaped_failure(e):
+                raise
+            logger.warning(
+                f"generate_content cookie-shaped failure ({type(e).__name__}: {e}); "
+                "refreshing from Chrome and retrying once."
+            )
+            await self._prewarm_cookies(force=True)
+            return await self.client.generate_content(
+                message, model=resolved_model, files=files, gem=resolved_gem
+            )
+
+    async def _prewarm_cookies(self, force: bool = False) -> None:
+        """Pull fresh cookies from chrome_server into the curl_cffi session.
+
+        Best-effort: if Chrome is unreachable, the lib's own auto_refresh
+        is still on the 9-minute schedule, so we keep the request flow
+        moving with whatever's already in the jar.
+        """
+        try:
+            from app.services.chrome_bridge import refresh_cookies_into_session
+
+            n = await refresh_cookies_into_session(self.client)
+            if force or n == 0:
+                logger.debug(f"[prewarm] grafted {n} cookies from chrome (force={force})")
+        except Exception as e:
+            logger.debug(f"[prewarm] skipped: {type(e).__name__}: {e}")
 
     async def fetch_gems(self):
         """Fetch available gems and cache them."""

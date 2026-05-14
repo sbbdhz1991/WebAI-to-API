@@ -12,3 +12,7 @@ loguru
 browser-cookie3
 lz4
 python-dotenv
+
+# Chrome DevTools Protocol — used by app.services.chrome_bridge to fetch
+# fresh Gemini cookies from the chrome_server container's running Chromium.
+websockets
