@@ -245,6 +245,79 @@ async def is_signed_in() -> bool:
     return "__Secure-1PSID" in cookies and "__Secure-1PSIDTS" in cookies
 
 
+async def reload_gemini_tab() -> bool:
+    """Find the chrome_server's gemini.google.com tab and reload it.
+
+    Used by the keepalive background task — making Chrome navigate
+    triggers its own DBSC cookie rotation + session refresh flow, which
+    is what stops Google from quietly killing the session as ``idle``.
+
+    Returns True if the post-reload URL still looks signed-in, False
+    if Chrome has been logged out (so callers can warn loudly). Any
+    exception is converted to False so the keepalive loop can't crash.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get(f"{CHROME_CDP_URL}/json/list", headers={"Host": "localhost"})
+            r.raise_for_status()
+            targets = r.json()
+    except Exception as e:
+        logger.warning(f"[chrome_bridge] reload: failed to list targets: {e}")
+        return False
+
+    tab = next(
+        (t for t in targets
+         if t.get("type") == "page"
+         and "gemini.google.com" in (t.get("url") or "")),
+        None,
+    )
+    if not tab:
+        logger.warning(
+            "[chrome_bridge] reload: no gemini.google.com tab open. "
+            "Has someone closed it in noVNC?"
+        )
+        return False
+
+    # Connect to this specific tab's CDP and ask it to navigate.
+    from urllib.parse import urlparse
+
+    p = urlparse(tab["webSocketDebuggerUrl"])
+    try:
+        import socket as _socket
+        sock = _socket.create_connection(
+            (urlparse(CHROME_CDP_URL).hostname, urlparse(CHROME_CDP_URL).port or 80)
+        )
+        sock.setblocking(False)
+        tab_ws = await websockets.connect(
+            f"ws://localhost{p.path}", sock=sock, max_size=None
+        )
+    except Exception as e:
+        logger.warning(f"[chrome_bridge] reload: tab WS connect failed: {e}")
+        return False
+
+    try:
+        await tab_ws.send(json.dumps({
+            "id": 1,
+            "method": "Page.navigate",
+            "params": {"url": "https://gemini.google.com/app"},
+        }))
+        # Drain a couple of frames so we don't leave the buffer full.
+        try:
+            await asyncio.wait_for(tab_ws.recv(), timeout=3.0)
+        except asyncio.TimeoutError:
+            pass
+    finally:
+        try:
+            await tab_ws.close()
+        except Exception:
+            pass
+
+    # Give the page a moment to start the auth/cookie dance, then
+    # check whether Chrome still has the auth cookies.
+    await asyncio.sleep(3.0)
+    return await is_signed_in()
+
+
 async def refresh_cookies_into_session(curl_session: Any) -> int:
     """Pull fresh cookies from Chrome and merge into a curl_cffi session jar.
 
