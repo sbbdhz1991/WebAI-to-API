@@ -2,6 +2,7 @@
 import asyncio
 from app.logger import logger
 from app.services.gemini_client import get_gemini_client, GeminiClientNotInitializedError
+from models.gemini import _is_cookie_shaped_failure
 
 class SessionManager:
     def __init__(self, client):
@@ -25,13 +26,29 @@ class SessionManager:
                 self.model = model
                 self.gem = gem
 
+            # Pre-warm cookies from chrome_server so a stale-on-edge PSIDCC
+            # never lands on the actual send_message request. See the matching
+            # logic in MyGeminiClient.generate_content for full rationale.
+            await self.client._prewarm_cookies()
+
             try:
                 # FIX: The underlying library `gemini-webapi` has changed its keyword arguments
                 # in a recent update. `message` is now `prompt` and `images` is now `files`.
                 return await self.session.send_message(prompt=message, files=images)
             except Exception as e:
-                logger.error(f"Error in session get_response: {e}", exc_info=True)
-                raise
+                if not _is_cookie_shaped_failure(e):
+                    logger.error(f"Error in session get_response: {e}", exc_info=True)
+                    raise
+                logger.warning(
+                    f"send_message cookie-shaped failure ({type(e).__name__}: {e}); "
+                    "refreshing from Chrome and retrying once."
+                )
+                await self.client._prewarm_cookies(force=True)
+                try:
+                    return await self.session.send_message(prompt=message, files=images)
+                except Exception as e2:
+                    logger.error(f"Error in session get_response after retry: {e2}", exc_info=True)
+                    raise
 
 _translate_session_manager = None
 _gemini_chat_manager = None

@@ -3,6 +3,58 @@
 # This file is for production mode only.
 
 services:
+  # ----------------------------------------------------------------------
+  # Real Chromium browser, headed (Xvfb), accessed for one-time login via
+  # noVNC on :6080. Owns the Google session: cookies + DBSC device key
+  # live in its profile volume. webai talks to it via Chrome DevTools
+  # Protocol on the internal docker network (port 9222, NOT published).
+  # ----------------------------------------------------------------------
+  chrome_server:
+    build:
+      context: ./docker/chrome
+    image: webai/chrome:latest
+    container_name: web_ai_chrome
+    restart: always
+    ports:
+      # noVNC web UI — bound to loopback only. Reach it via a 1panel
+      # reverse-proxy site that adds IP whitelist + HTTP Basic Auth,
+      # otherwise anyone scanning the VPS can take over the Google
+      # session. Do NOT change to "6080:6080" without those upstream
+      # protections in place.
+      - "127.0.0.1:6080:6080"
+      # Note: 9222 (CDP) is intentionally NOT published. Anyone with
+      # access to that port can execute arbitrary code in Chromium pages
+      # and dump cookies. It is only reachable from inside app_net.
+    environment:
+      # VNC password — set in .env. The VNC protocol caps passwords at 8
+      # characters (longer values are silently truncated), so this is a
+      # "stop drive-by scans" layer, NOT real auth. For real protection
+      # put noVNC behind a reverse proxy with HTTP basic auth or an IP
+      # whitelist. Leave unset to disable the password (NOT recommended).
+      - VNC_PASSWORD=${VNC_PASSWORD:-}
+    volumes:
+      # Persist Chromium's profile (cookies, DBSC key, history, etc.)
+      # across restarts. Without this, every container restart loses
+      # the Google login.
+      - ./data/chrome-profile:/data/chrome-profile
+    shm_size: "2gb"
+    networks:
+      - app_net
+    # Chromium takes ~10-30s to fully boot CDP. webai's init pulls
+    # cookies via CDP and dies if Chromium isn't ready yet — gate
+    # webai's start on this healthcheck passing instead of just the
+    # container being up.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null -S --header='Host: localhost' http://127.0.0.1:9222/json/version 2>&1 | grep -q '200 OK' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  # ----------------------------------------------------------------------
+  # FastAPI server. No longer auto-refreshes cookies on its own — pulls
+  # them from chrome_server on demand (see app.services.chrome_bridge).
+  # ----------------------------------------------------------------------
   web_ai:
     build: .
     image: cornatul/webai.ai
@@ -21,6 +73,8 @@ services:
       # Persist gemini-webapi's auto-rotated __Secure-1PSIDTS cache across
       # container restarts (paired with the ./data volume mount below).
       - GEMINI_COOKIE_PATH=/app/data/gemini_cache
+      # Chromium CDP endpoint. service-name resolution inside app_net.
+      - CHROME_CDP_URL=http://chrome_server:9222
     volumes:
       # Make config editable from the host without rebuilding the image.
       - ./config.conf:/app/config.conf
@@ -28,6 +82,9 @@ services:
       # latest 1PSIDTS after a restart instead of using the stale value
       # baked into config.conf at build time.
       - ./data:/app/data
+    depends_on:
+      chrome_server:
+        condition: service_healthy
     networks:
       - app_net
     # Single worker on purpose: each worker keeps its own in-memory Gemini
