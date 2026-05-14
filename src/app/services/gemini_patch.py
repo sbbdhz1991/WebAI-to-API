@@ -971,6 +971,70 @@ def _set_cookie_in_jar(jar: Any, name: str, value: str) -> bool:
     return False
 
 
+# Path inside a stream "part" where gemini-webapi extracts the numeric
+# error code. When this lookup returns a non-falsy value AND the code is
+# not in the lib's known ErrorCode enum, we dump the full part so that
+# whatever human-readable reason Google included (and the lib threw
+# away) shows up in our logs.
+_ERROR_CODE_PATH = [5, 2, 0, 1, 0]
+_LIB_KNOWN_ERROR_CODES = {1013, 1037, 1050, 1052, 1060}
+
+
+def _patch_dump_unknown_error_part() -> None:
+    """Wrap ``get_nested_value`` so that when the stream-parser pulls an
+    unknown numeric error code out of a response part, the full part
+    payload is logged for diagnosis.
+
+    Without this, gemini-webapi reports any unknown code (e.g., 1100) as
+    a generic ``APIError("...Unknown API error code: 1100...")`` and the
+    actual reason Google sent (safety reject, quota, etc.) is discarded.
+    """
+    try:
+        import gemini_webapi.utils.parsing as _parsing
+    except ImportError:
+        logger.warning("[patch] gemini_webapi.utils.parsing not found; skip error-dump")
+        return
+
+    if not hasattr(_parsing, "get_nested_value"):
+        logger.warning("[patch] get_nested_value not in parsing module")
+        return
+
+    if getattr(_parsing.get_nested_value, "__webai_patched__", False):
+        return
+
+    _orig = _parsing.get_nested_value
+
+    @wraps(_orig)
+    def patched(data, path, default=None):
+        result = _orig(data, path, default)
+        # Cheap path check first — comparing two short lists is fine.
+        if path == _ERROR_CODE_PATH and result and result not in _LIB_KNOWN_ERROR_CODES:
+            try:
+                import json as _json
+                snippet = _json.dumps(data, ensure_ascii=False)[:8000]
+                logger.warning(
+                    f"[patch] UNKNOWN ERROR CODE {result} — Google's full response part:\n"
+                    f"{snippet}"
+                )
+            except Exception as e:
+                logger.warning(f"[patch] code {result} dump failed: {e}")
+        return result
+
+    patched.__webai_patched__ = True
+    _parsing.get_nested_value = patched
+
+    # client.py imported get_nested_value at module-load time, so the
+    # name there is bound to the original function. Rebind it.
+    try:
+        import gemini_webapi.client as _client_mod
+        if hasattr(_client_mod, "get_nested_value"):
+            _client_mod.get_nested_value = patched
+    except ImportError:
+        pass
+
+    logger.info("[patch] get_nested_value -> dump full part on unknown error codes")
+
+
 def _patch_rotate_1psidts_use_chrome() -> None:
     """Replace gemini-webapi's rotate_1psidts with the Chrome-backed coroutine.
 
@@ -1031,6 +1095,7 @@ def apply_patches() -> None:
 
     _patch_watchdog_timeout()
     _patch_rotate_1psidts_use_chrome()
+    _patch_dump_unknown_error_part()
 
     logger.info(
         "[patch] gemini_webapi.upload_file -> resumable browser-compatible flow"
