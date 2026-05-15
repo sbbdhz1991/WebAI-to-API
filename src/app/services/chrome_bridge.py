@@ -245,6 +245,173 @@ async def is_signed_in() -> bool:
     return "__Secure-1PSID" in cookies and "__Secure-1PSIDTS" in cookies
 
 
+# -------------------------- diagnostic --------------------------------
+# Used by the /debug/cookies endpoint. When fetch_gemini_cookies looks
+# like it's missing auth cookies, this runs the same query through 5
+# different CDP code paths and reports which methods see which cookies,
+# so you can tell "Chrome lost the session" apart from "our CDP query
+# layer has a bug".
+
+_KEY_AUTH_COOKIES = (
+    "__Secure-1PSID",
+    "__Secure-1PSIDTS",
+    "__Secure-1PSIDCC",
+    "SAPISID",
+    "__Secure-1PAPISID",
+    "HSID",
+    "SSID",
+    "SID",
+)
+
+
+def _summarize_cookies(cookies: list) -> dict:
+    """Compact summary of a cookie list for the diagnostic endpoint."""
+    google_names: list[str] = []
+    for c in cookies or []:
+        domain = (c.get("domain") or "").lstrip(".").lower()
+        if domain == "google.com" or domain.endswith(".google.com"):
+            name = c.get("name")
+            if name:
+                google_names.append(name)
+    name_set = set(google_names)
+    return {
+        "total": len(cookies or []),
+        "google_count": len(google_names),
+        "google_names": sorted(name_set),
+        "auth_present": {k: (k in name_set) for k in _KEY_AUTH_COOKIES},
+    }
+
+
+async def _diagnose_per_tab(tab: dict) -> dict:
+    """Open a tab-level CDP socket and run page-scoped cookie queries."""
+    from urllib.parse import urlparse
+    import socket as _socket
+
+    p = urlparse(tab["webSocketDebuggerUrl"])
+    out: dict = {"url": tab.get("url")}
+    try:
+        sock = _socket.create_connection(
+            (urlparse(CHROME_CDP_URL).hostname, urlparse(CHROME_CDP_URL).port or 80)
+        )
+        sock.setblocking(False)
+        ws = await websockets.connect(
+            f"ws://localhost{p.path}", sock=sock, max_size=None
+        )
+    except Exception as e:
+        return {**out, "connect_error": f"{type(e).__name__}: {e}"}
+
+    seq = {"id": 0}
+
+    async def call(method: str, params: dict | None = None) -> dict:
+        seq["id"] += 1
+        mid = seq["id"]
+        await ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        deadline = asyncio.get_event_loop().time() + 10.0
+        while True:
+            rem = deadline - asyncio.get_event_loop().time()
+            if rem <= 0:
+                raise TimeoutError(f"CDP timeout on {method}")
+            raw = await asyncio.wait_for(ws.recv(), timeout=rem)
+            msg = json.loads(raw)
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise RuntimeError(str(msg["error"]))
+                return msg.get("result", {})
+
+    try:
+        try:
+            r = await call("Network.getCookies")
+            out["network_getCookies"] = _summarize_cookies(r.get("cookies", []))
+        except Exception as e:
+            out["network_getCookies"] = {"error": f"{type(e).__name__}: {e}"}
+
+        try:
+            r = await call(
+                "Network.getCookies",
+                {"urls": ["https://gemini.google.com/",
+                          "https://accounts.google.com/"]},
+            )
+            out["network_getCookies_urls"] = _summarize_cookies(r.get("cookies", []))
+        except Exception as e:
+            out["network_getCookies_urls"] = {"error": f"{type(e).__name__}: {e}"}
+
+        try:
+            r = await call(
+                "Runtime.evaluate",
+                {"expression": "document.cookie", "returnByValue": True},
+            )
+            out["document_cookie"] = r.get("result", {}).get("value", "")
+        except Exception as e:
+            out["document_cookie"] = {"error": f"{type(e).__name__}: {e}"}
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+    return out
+
+
+async def diagnose_cookies() -> dict:
+    """Side-by-side comparison of multiple CDP cookie-retrieval methods.
+
+    Hit this when fetch_gemini_cookies looks like it's missing auth
+    cookies and you want to know whether the loss is real (Chrome is
+    logged out) or an artifact of one CDP API not exposing certain
+    cookie kinds (HttpOnly, partitioned, cross-context, ...).
+    """
+    summary: dict = {}
+
+    # 1. List all targets so the reader can see what tabs exist.
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get(
+                f"{CHROME_CDP_URL}/json/list",
+                headers=_LOCALHOST_HOST_HEADER,
+            )
+            r.raise_for_status()
+            targets = r.json()
+    except Exception as e:
+        return {"error": f"could not list targets: {type(e).__name__}: {e}"}
+
+    summary["tabs"] = [
+        {
+            "type": t.get("type"),
+            "url": t.get("url", "")[:120],
+            "id_prefix": (t.get("id") or "")[:12],
+        }
+        for t in targets
+    ]
+
+    # 2. Browser-level Storage.getCookies (our current production method).
+    try:
+        r = await _cdp_call("Storage.getCookies")
+        summary["storage_getCookies"] = _summarize_cookies(r.get("cookies", []))
+    except Exception as e:
+        summary["storage_getCookies"] = {"error": f"{type(e).__name__}: {e}"}
+
+    # 3. Browser-level Network.getAllCookies — different code path.
+    try:
+        r = await _cdp_call("Network.getAllCookies")
+        summary["network_getAllCookies"] = _summarize_cookies(r.get("cookies", []))
+    except Exception as e:
+        summary["network_getAllCookies"] = {"error": f"{type(e).__name__}: {e}"}
+
+    # 4. Per-tab queries on the gemini.google.com tab.
+    gemini_tab = next(
+        (t for t in targets
+         if t.get("type") == "page"
+         and "gemini.google.com" in (t.get("url") or "")),
+        None,
+    )
+    summary["per_tab"] = (
+        await _diagnose_per_tab(gemini_tab) if gemini_tab
+        else {"error": "no gemini.google.com tab open"}
+    )
+
+    return summary
+
+
 async def reload_gemini_tab() -> bool:
     """Find the chrome_server's gemini.google.com tab and reload it.
 

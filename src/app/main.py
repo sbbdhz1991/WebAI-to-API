@@ -17,7 +17,7 @@ from app.auth import verify_api_key, API_KEY_ENV_VAR
 from app.logger import logger
 
 # Import endpoint routers
-from app.endpoints import gemini, chat, google_generative
+from app.endpoints import gemini, chat, google_generative, debug
 
 import asyncio
 import os
@@ -140,3 +140,4 @@ _auth_dependencies = [Depends(verify_api_key)]
 app.include_router(gemini.router, dependencies=_auth_dependencies)
 app.include_router(chat.router, dependencies=_auth_dependencies)
 app.include_router(google_generative.router, dependencies=_auth_dependencies)
+app.include_router(debug.router, dependencies=_auth_dependencies)
