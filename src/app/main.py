@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.services.gemini_client import get_gemini_client, init_gemini_client, GeminiClientNotInitializedError
 from app.services.session_manager import init_session_managers
-from app.services.chrome_bridge import reload_gemini_tab, ChromeBridgeError
+from app.services.chrome_bridge import keepalive_probe
 from app.auth import verify_api_key, API_KEY_ENV_VAR
 from app.logger import logger
 
@@ -47,17 +47,45 @@ async def _chrome_keepalive_loop() -> None:
         f"Chrome keepalive started: tab reload every "
         f"{_CHROME_KEEPALIVE_INTERVAL}s."
     )
+    cycle = 0
     while True:
         try:
             await asyncio.sleep(_CHROME_KEEPALIVE_INTERVAL)
-            ok = await reload_gemini_tab()
-            if ok:
-                logger.debug("[keepalive] Chrome reload OK, still signed in.")
+            cycle += 1
+            logger.info(f"[keepalive] cycle #{cycle} start")
+            report = await keepalive_probe()
+
+            def _fp(v):
+                # Fingerprint a cookie value: first 8 chars + last 4 + length.
+                # Enough to spot rotation without leaking the full token.
+                if not isinstance(v, str) or not v:
+                    return "<none>"
+                if len(v) <= 12:
+                    return f"{v}(len={len(v)})"
+                return f"{v[:8]}..{v[-4:]}(len={len(v)})"
+
+            key_summary = ",".join(
+                k for k, present in report.get("key_cookies", {}).items()
+                if present
+            ) or "<none>"
+            log_line = (
+                f"[keepalive] cycle #{cycle} done: "
+                f"ok={report['ok']} reason={report['reason']!r} "
+                f"final_url={report.get('final_url')!r} "
+                f"signed_out_redirect={report.get('location_signed_out')} "
+                f"load_ms={report.get('load_elapsed_ms')} "
+                f"psidts_before={_fp(report.get('psidts_before'))} "
+                f"psidts_after={_fp(report.get('psidts_after'))} "
+                f"psidts_rotated={report.get('psidts_rotated')} "
+                f"key_cookies_present=[{key_summary}]"
+            )
+            if report["ok"]:
+                logger.info(log_line)
             else:
                 logger.error(
-                    "[keepalive] Chrome appears SIGNED OUT or unreachable. "
-                    "Re-login via noVNC (http://<host>:6080/vnc.html) — "
-                    "subsequent requests will fail until cookies are valid."
+                    log_line
+                    + "  -- session looks dead; re-login via noVNC "
+                    "(http://<host>:6080/vnc.html)"
                 )
         except asyncio.CancelledError:
             logger.info("Chrome keepalive task cancelled.")
@@ -65,7 +93,11 @@ async def _chrome_keepalive_loop() -> None:
         except Exception as e:
             # Never let a keepalive failure kill the task — log and
             # continue, the next cycle might find Chrome healthy.
-            logger.warning(f"[keepalive] cycle error ({type(e).__name__}): {e}")
+            logger.warning(
+                f"[keepalive] cycle #{cycle} crashed "
+                f"({type(e).__name__}): {e}",
+                exc_info=True,
+            )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

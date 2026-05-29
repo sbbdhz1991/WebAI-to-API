@@ -485,6 +485,225 @@ async def reload_gemini_tab() -> bool:
     return await is_signed_in()
 
 
+async def _psidts_snapshot() -> Optional[str]:
+    """Read just the current __Secure-1PSIDTS value from Chromium's jar.
+
+    Returns the raw value or None if not present. Swallows errors so it's
+    safe to call from a diagnostic path.
+    """
+    try:
+        result = await _cdp_call("Storage.getCookies")
+    except Exception:
+        return None
+    for c in result.get("cookies", []) or []:
+        if c.get("name") == "__Secure-1PSIDTS":
+            v = c.get("value")
+            if isinstance(v, str):
+                return v
+    return None
+
+
+async def keepalive_probe() -> dict:
+    """Reload the gemini tab and return a structured health report.
+
+    Replaces the old ``reload_gemini_tab + is_signed_in`` combo, which
+    only checked whether cookies still existed locally (false-positive
+    prone — Chrome jar can hold cookies that Google's already invalidated
+    server-side). This probe answers three things per cycle:
+
+      1. Did Chrome actually rotate __Secure-1PSIDTS during the reload?
+         (psidts_before vs psidts_after — same value across many cycles
+         means DBSC rotation isn't firing on bare navigation.)
+      2. Did the navigation complete? Waits for Page.loadEventFired with
+         a bounded timeout instead of a blind sleep.
+      3. After load, where is the page? If window.location.href contains
+         "accounts.google.com" we are server-side logged out, regardless
+         of what cookies are still in the jar.
+
+    Returns a dict with: ok (bool), reason (str), tab_url, psidts_before,
+    psidts_after, psidts_rotated (bool), load_elapsed_ms, final_url,
+    location_signed_out (bool), key_cookies (dict[str,bool]). Never
+    raises — failures are reported via reason.
+    """
+    report: dict = {
+        "ok": False,
+        "reason": "",
+        "tab_url": None,
+        "psidts_before": None,
+        "psidts_after": None,
+        "psidts_rotated": None,
+        "load_elapsed_ms": None,
+        "final_url": None,
+        "location_signed_out": None,
+        "key_cookies": {},
+    }
+
+    # ---- 0. snapshot cookies BEFORE reload ---------------------------
+    try:
+        before = await fetch_gemini_cookies()
+        report["psidts_before"] = before.get("__Secure-1PSIDTS")
+        report["key_cookies"] = {
+            k: (k in before) for k in _KEY_AUTH_COOKIES
+        }
+    except ChromeBridgeError as e:
+        report["reason"] = f"pre-reload cookie fetch failed: {e}"
+        return report
+
+    # ---- 1. find the gemini tab --------------------------------------
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get(
+                f"{CHROME_CDP_URL}/json/list",
+                headers=_LOCALHOST_HOST_HEADER,
+            )
+            r.raise_for_status()
+            targets = r.json()
+    except Exception as e:
+        report["reason"] = f"list targets failed: {type(e).__name__}: {e}"
+        return report
+
+    tab = next(
+        (t for t in targets
+         if t.get("type") == "page"
+         and "gemini.google.com" in (t.get("url") or "")),
+        None,
+    )
+    if not tab:
+        report["reason"] = "no gemini.google.com tab open (closed in noVNC?)"
+        return report
+    report["tab_url"] = tab.get("url")
+
+    # ---- 2. connect to tab CDP ---------------------------------------
+    from urllib.parse import urlparse
+    p = urlparse(tab["webSocketDebuggerUrl"])
+    try:
+        import socket as _socket
+        sock = _socket.create_connection(
+            (urlparse(CHROME_CDP_URL).hostname,
+             urlparse(CHROME_CDP_URL).port or 80)
+        )
+        sock.setblocking(False)
+        tab_ws = await websockets.connect(
+            f"ws://localhost{p.path}", sock=sock, max_size=None
+        )
+    except Exception as e:
+        report["reason"] = f"tab WS connect failed: {type(e).__name__}: {e}"
+        return report
+
+    seq = {"id": 0}
+
+    async def call(method: str, params: dict | None = None,
+                   timeout: float = 8.0) -> dict:
+        seq["id"] += 1
+        mid = seq["id"]
+        await tab_ws.send(json.dumps({
+            "id": mid, "method": method, "params": params or {}
+        }))
+        end = asyncio.get_event_loop().time() + timeout
+        while True:
+            rem = end - asyncio.get_event_loop().time()
+            if rem <= 0:
+                raise TimeoutError(f"CDP timeout on {method}")
+            raw = await asyncio.wait_for(tab_ws.recv(), timeout=rem)
+            msg = json.loads(raw)
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise RuntimeError(str(msg["error"]))
+                return msg.get("result", {})
+            # other side: ignored event — keep reading.
+
+    try:
+        # ---- 3. enable Page events, navigate, wait for loadEventFired
+        try:
+            await call("Page.enable")
+        except Exception as e:
+            report["reason"] = f"Page.enable failed: {e}"
+            return report
+
+        try:
+            await tab_ws.send(json.dumps({
+                "id": 9999,
+                "method": "Page.navigate",
+                "params": {"url": "https://gemini.google.com/app"},
+            }))
+        except Exception as e:
+            report["reason"] = f"Page.navigate send failed: {e}"
+            return report
+
+        load_start = asyncio.get_event_loop().time()
+        load_seen = False
+        LOAD_TIMEOUT = 15.0
+        try:
+            while asyncio.get_event_loop().time() - load_start < LOAD_TIMEOUT:
+                rem = LOAD_TIMEOUT - (asyncio.get_event_loop().time() - load_start)
+                raw = await asyncio.wait_for(tab_ws.recv(), timeout=rem)
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                if msg.get("method") == "Page.loadEventFired":
+                    load_seen = True
+                    break
+        except asyncio.TimeoutError:
+            pass
+        report["load_elapsed_ms"] = int(
+            (asyncio.get_event_loop().time() - load_start) * 1000
+        )
+        if not load_seen:
+            report["reason"] = (
+                f"Page.loadEventFired not seen within {LOAD_TIMEOUT}s "
+                f"(page hung or already loaded from cache)"
+            )
+            # don't return — still try to read URL + cookies, partial info useful
+
+        # ---- 4. read window.location.href --------------------------------
+        try:
+            r = await call(
+                "Runtime.evaluate",
+                {"expression": "window.location.href", "returnByValue": True},
+                timeout=5.0,
+            )
+            final_url = r.get("result", {}).get("value") or ""
+            report["final_url"] = final_url
+            report["location_signed_out"] = (
+                "accounts.google.com" in final_url
+                or "/signin" in final_url
+                or "/ServiceLogin" in final_url
+            )
+        except Exception as e:
+            report["final_url"] = f"<eval error: {type(e).__name__}: {e}>"
+    finally:
+        try:
+            await tab_ws.close()
+        except Exception:
+            pass
+
+    # ---- 5. snapshot cookies AFTER reload ----------------------------
+    # Give Chrome a brief grace for any post-load XHR (DBSC rotation) to settle.
+    await asyncio.sleep(2.0)
+    report["psidts_after"] = await _psidts_snapshot()
+    if report["psidts_before"] and report["psidts_after"]:
+        report["psidts_rotated"] = (
+            report["psidts_before"] != report["psidts_after"]
+        )
+
+    # ---- 6. final verdict --------------------------------------------
+    if report["location_signed_out"]:
+        report["reason"] = (
+            f"page redirected to login: final_url={report['final_url']!r}"
+        )
+        report["ok"] = False
+    elif not all(report["key_cookies"].get(k) for k in
+                 ("__Secure-1PSID", "__Secure-1PSIDTS")):
+        report["reason"] = "core auth cookies missing from Chrome jar"
+        report["ok"] = False
+    else:
+        report["ok"] = True
+        if not report["reason"]:
+            report["reason"] = "healthy"
+    return report
+
+
 async def refresh_cookies_into_session(curl_session: Any) -> int:
     """Pull fresh cookies from Chrome and merge into a curl_cffi session jar.
 
