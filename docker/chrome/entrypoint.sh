@@ -21,6 +21,17 @@ CDP_PORT="${CDP_PORT:-9222}"
 CDP_INTERNAL_PORT="${CDP_INTERNAL_PORT:-9333}"
 USER_DATA_DIR="${USER_DATA_DIR:-/data/chrome-profile}"
 START_URL="${START_URL:-https://gemini.google.com/app}"
+# Optional upstream proxy for ALL of Chromium's traffic (login + DBSC
+# rotation). Empty = direct (current behaviour, unchanged). Set this to
+# route the Google session through a clean/residential exit IP, which is
+# the single biggest lever against Google revoking a session that it sees
+# originating from a datacenter IP. Format: "http://host:port" or
+# "socks5://host:port". IMPORTANT: prefer a proxy authenticated by
+# IP-whitelist, NOT user:pass — headless Chromium cannot answer a proxy
+# auth dialog, so user:pass proxies need a local non-auth bridge
+# (gost/3proxy/tinyproxy) in front. Use a STABLE exit IP in the account's
+# usual region; a rotating-IP proxy makes things worse, not better.
+PROXY_SERVER="${PROXY_SERVER:-}"
 
 # First-launch privilege gate: when we boot as root (always, in this image),
 # we own the bind-mounted profile dir to the chrome user — the host dir
@@ -142,18 +153,23 @@ echo "[entrypoint] launching Chromium (CDP loopback :${CDP_INTERNAL_PORT}, profi
 # --remote-allow-origins=* required since Chrome 111: even when CDP is
 # reachable, the WebSocket Origin check rejects clients with unfamiliar
 # (or absent) Origin headers unless we explicitly allow any origin.
-exec chromium \
-    --no-sandbox \
-    --no-first-run \
-    --no-default-browser-check \
-    --disable-gpu \
-    --disable-dev-shm-usage \
-    --disable-features=Translate,InfiniteSessionRestore \
-    --password-store=basic \
-    --use-mock-keychain \
-    --remote-debugging-port="${CDP_INTERNAL_PORT}" \
-    --remote-allow-origins=* \
-    --user-data-dir="${USER_DATA_DIR}" \
-    --window-size=1280,720 \
-    --start-maximized \
-    "${START_URL}"
+CHROME_ARGS=(
+    --no-sandbox
+    --no-first-run
+    --no-default-browser-check
+    --disable-gpu
+    --disable-dev-shm-usage
+    --disable-features=Translate,InfiniteSessionRestore
+    --password-store=basic
+    --use-mock-keychain
+    --remote-debugging-port="${CDP_INTERNAL_PORT}"
+    --remote-allow-origins=*
+    --user-data-dir="${USER_DATA_DIR}"
+    --window-size=1280,720
+    --start-maximized
+)
+if [ -n "${PROXY_SERVER}" ]; then
+    echo "[entrypoint] routing Chromium through proxy: ${PROXY_SERVER}"
+    CHROME_ARGS+=( --proxy-server="${PROXY_SERVER}" )
+fi
+exec chromium "${CHROME_ARGS[@]}" "${START_URL}"

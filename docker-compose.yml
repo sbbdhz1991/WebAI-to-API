@@ -32,6 +32,13 @@ services:
       # put noVNC behind a reverse proxy with HTTP basic auth or an IP
       # whitelist. Leave unset to disable the password (NOT recommended).
       - VNC_PASSWORD=${VNC_PASSWORD:-}
+      # Optional: route ALL Chromium traffic (login + DBSC rotation) through
+      # a clean/residential exit IP to reduce Google revoking the session
+      # for originating from a datacenter IP. Empty/unset = direct. Use a
+      # STABLE IP in the account's usual region; IP-whitelist auth (not
+      # user:pass — headless Chromium can't answer a proxy auth dialog).
+      #   e.g. PROXY_SERVER=http://10.0.0.5:8080  or  socks5://10.0.0.5:1080
+      - PROXY_SERVER=${PROXY_SERVER:-}
     volumes:
       # Persist Chromium's profile (cookies, DBSC key, history, etc.)
       # across restarts. Without this, every container restart loses

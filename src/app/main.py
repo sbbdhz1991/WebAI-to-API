@@ -23,28 +23,31 @@ import asyncio
 import os
 
 
-# Default keepalive interval: 5 minutes. Short enough to keep Chrome's
-# DBSC chain warm (PSIDRTS rotates every 10 min — refresh before it
-# expires), long enough not to spam Google or interfere with manual
-# noVNC use too aggressively.
+# Health-probe interval, default 5 minutes. The probe is now PASSIVE — it
+# only reads Chrome's cookie jar over CDP and makes no outbound request to
+# Google — so this is purely a detection-latency knob, not a keep-alive
+# cadence (Chrome rotates DBSC cookies on its own ~10-min timer regardless
+# of us). Set CHROME_KEEPALIVE_INTERVAL=0 to disable monitoring.
 _CHROME_KEEPALIVE_INTERVAL = int(os.environ.get("CHROME_KEEPALIVE_INTERVAL", "300"))
 
 
 async def _chrome_keepalive_loop() -> None:
-    """Background loop that periodically reloads the gemini.google.com
-    tab in chrome_server, so Chrome's DBSC cookie rotation keeps firing
-    and the Google session doesn't get killed for inactivity.
+    """Background loop that periodically checks whether Chrome still holds
+    a live Google session, logging loudly the moment it doesn't so an
+    operator can re-login via noVNC — well before chat requests start
+    silently degrading to the anonymous, rate-limited Gemini.
 
-    On every cycle we also verify Chrome still has auth cookies; if not,
-    we log loudly so operators see the session needs a re-login via
-    noVNC — well before the next chat request fails with 1100.
+    This used to *reload* the gemini tab every cycle on the theory that a
+    navigation would refresh the DBSC cookie chain. Production logs
+    disproved that (Chrome rotates on its own timer regardless of reloads),
+    so the loop is now a passive health probe — see ``keepalive_probe``.
     """
     if _CHROME_KEEPALIVE_INTERVAL <= 0:
-        logger.info("Chrome keepalive disabled (CHROME_KEEPALIVE_INTERVAL=0).")
+        logger.info("Chrome session monitor disabled (CHROME_KEEPALIVE_INTERVAL=0).")
         return
 
     logger.info(
-        f"Chrome keepalive started: tab reload every "
+        f"Chrome session monitor started: passive health probe every "
         f"{_CHROME_KEEPALIVE_INTERVAL}s."
     )
     cycle = 0
@@ -52,49 +55,46 @@ async def _chrome_keepalive_loop() -> None:
         try:
             await asyncio.sleep(_CHROME_KEEPALIVE_INTERVAL)
             cycle += 1
-            logger.info(f"[keepalive] cycle #{cycle} start")
             report = await keepalive_probe()
 
             def _fp(v):
                 # Fingerprint a cookie value: first 8 chars + last 4 + length.
-                # Enough to spot rotation without leaking the full token.
+                # Enough to spot rotation across cycles (compare consecutive
+                # log lines) without leaking the full token.
                 if not isinstance(v, str) or not v:
                     return "<none>"
                 if len(v) <= 12:
                     return f"{v}(len={len(v)})"
                 return f"{v[:8]}..{v[-4:]}(len={len(v)})"
 
-            key_summary = ",".join(
-                k for k, present in report.get("key_cookies", {}).items()
-                if present
+            present = ",".join(
+                k for k, ok in report.get("key_cookies", {}).items() if ok
             ) or "<none>"
             log_line = (
-                f"[keepalive] cycle #{cycle} done: "
+                f"[monitor] cycle #{cycle}: "
                 f"ok={report['ok']} reason={report['reason']!r} "
-                f"final_url={report.get('final_url')!r} "
-                f"signed_out_redirect={report.get('location_signed_out')} "
-                f"load_ms={report.get('load_elapsed_ms')} "
-                f"psidts_before={_fp(report.get('psidts_before'))} "
-                f"psidts_after={_fp(report.get('psidts_after'))} "
-                f"psidts_rotated={report.get('psidts_rotated')} "
-                f"key_cookies_present=[{key_summary}]"
+                f"stable_present={report.get('stable_present')} "
+                f"psidts={_fp(report.get('psidts'))} "
+                f"key_present=[{present}]"
             )
-            if report["ok"]:
-                logger.info(log_line)
-            else:
+            if not report["ok"]:
                 logger.error(
                     log_line
                     + "  -- session looks dead; re-login via noVNC "
                     "(http://<host>:6080/vnc.html)"
                 )
+            elif report["reason"].startswith("WARN"):
+                logger.warning(log_line)
+            else:
+                logger.info(log_line)
         except asyncio.CancelledError:
-            logger.info("Chrome keepalive task cancelled.")
+            logger.info("Chrome session monitor task cancelled.")
             return
         except Exception as e:
-            # Never let a keepalive failure kill the task — log and
-            # continue, the next cycle might find Chrome healthy.
+            # Never let a probe failure kill the task — log and continue;
+            # the next cycle might find Chrome healthy.
             logger.warning(
-                f"[keepalive] cycle #{cycle} crashed "
+                f"[monitor] cycle #{cycle} crashed "
                 f"({type(e).__name__}): {e}",
                 exc_info=True,
             )
