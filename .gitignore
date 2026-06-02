@@ -1,5 +1,9 @@
 # File; .gitignore
 
+# Local secrets — live API key, proxy credentials, VNC password. Tracked
+# template lives in .env.example. NEVER commit the real .env.
+.env
+
 .vscode
 .python-version
 __pycache__
