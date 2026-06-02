@@ -22,8 +22,8 @@ from pathlib import Path
 
 import httpx
 
-DEFAULT_URL = os.environ.get("WEBAI_URL", "http://***REMOVED***:6969")
-DEFAULT_KEY = os.environ.get("GEMINI_API_KEY", "***REMOVED***")  # optional
+DEFAULT_URL = os.environ.get("WEBAI_URL", "http://localhost:6969")
+DEFAULT_KEY = os.environ.get("GEMINI_API_KEY", "")  # set if the server has auth enabled
 DEFAULT_PROMPT = "请概述这段视频的内容，并列出关键时间点。"
 DEFAULT_MODEL = "gemini-3-pro"  # video works best on pro
 
