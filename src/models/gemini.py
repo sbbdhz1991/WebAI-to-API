@@ -1,3 +1,4 @@
+import asyncio
 import configparser
 import logging
 import os
@@ -12,6 +13,11 @@ from gemini_webapi.utils.rotate_1psidts import (
 from app.config import CONFIG
 
 logger = logging.getLogger("app")
+
+# Hard ceiling for the pre-request cookie pre-warm (best-effort; see
+# MyGeminiClient._prewarm_cookies). Kept short on purpose so a slow
+# chrome_server can't stall the request hot path.
+_PREWARM_TIMEOUT = float(os.environ.get("WEBAI_PREWARM_TIMEOUT", "8"))
 
 
 # Error patterns that look like "your cookies just went stale" — these are
@@ -148,9 +154,22 @@ class MyGeminiClient:
         try:
             from app.services.chrome_bridge import refresh_cookies_into_session
 
-            n = await refresh_cookies_into_session(self.client)
+            # Hard ceiling on the whole pre-warm: this sits on every request's
+            # critical path, and it's explicitly best-effort (the lib's own
+            # auto_refresh keeps cookies fresh on its 9-min cycle). Never let it
+            # become the thing that hangs a request — bail and proceed with
+            # whatever's already in the jar if Chrome is slow.
+            n = await asyncio.wait_for(
+                refresh_cookies_into_session(self.client),
+                timeout=_PREWARM_TIMEOUT,
+            )
             if force or n == 0:
                 logger.debug(f"[prewarm] grafted {n} cookies from chrome (force={force})")
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[prewarm] chrome cookie refresh exceeded {_PREWARM_TIMEOUT}s; "
+                "proceeding with cookies already in the jar."
+            )
         except Exception as e:
             logger.debug(f"[prewarm] skipped: {type(e).__name__}: {e}")
 

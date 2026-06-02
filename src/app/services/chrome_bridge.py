@@ -36,6 +36,14 @@ logger = logging.getLogger("app")
 
 CHROME_CDP_URL = os.environ.get("CHROME_CDP_URL", "http://chrome_server:9222")
 
+# Hard timeouts so a slow/unreachable Chromium can never wedge the event
+# loop. Every request's cookie pre-warm runs through _cdp_call, so an
+# unbounded blocking connect/send here freezes the whole uvicorn worker.
+#   _CONNECT_TIMEOUT — TCP connect + WS upgrade ceiling.
+#   _CDP_CALL_TIMEOUT — single CDP send+reply ceiling.
+_CONNECT_TIMEOUT = float(os.environ.get("CHROME_CDP_CONNECT_TIMEOUT", "5"))
+_CDP_CALL_TIMEOUT = float(os.environ.get("CHROME_CDP_CALL_TIMEOUT", "15"))
+
 # Single shared connection guarded by a lock so we don't open N parallel
 # CDP sockets from concurrent requests.
 _ws: Optional[Any] = None
@@ -130,9 +138,16 @@ async def _get_ws() -> Any:
     ws_path = parsed.path or "/"
 
     # 1. Real TCP connection to the docker service name + port.
+    #    create_connection is BLOCKING — run it off the event loop and cap
+    #    it, or an unreachable Chromium freezes the entire worker.
     import socket as _socket
 
-    sock = _socket.create_connection((real_host, real_port))
+    sock = await asyncio.wait_for(
+        asyncio.to_thread(
+            _socket.create_connection, (real_host, real_port), _CONNECT_TIMEOUT
+        ),
+        timeout=_CONNECT_TIMEOUT + 1,
+    )
     sock.setblocking(False)
 
     # 2. URI used purely for header derivation — Host becomes "localhost".
@@ -142,11 +157,14 @@ async def _get_ws() -> Any:
         f"[chrome_bridge] connecting CDP via {real_host}:{real_port} "
         f"(spoofed Host=localhost)"
     )
-    _ws = await websockets.connect(
-        spoof_uri,
-        sock=sock,
-        max_size=None,
-        ping_interval=20,
+    _ws = await asyncio.wait_for(
+        websockets.connect(
+            spoof_uri,
+            sock=sock,
+            max_size=None,
+            ping_interval=20,
+        ),
+        timeout=_CONNECT_TIMEOUT,
     )
     return _ws
 
@@ -170,29 +188,42 @@ async def _cdp_call(method: str, params: dict[str, Any] | None = None) -> dict[s
     """
     global _msg_id
     async with _ws_lock:
-        ws = await _get_ws()
-        _msg_id += 1
-        msg_id = _msg_id
-        await ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
-        # Bounded read loop: drop unrelated events until our reply lands.
-        # 15s is plenty for a cookie dump from a healthy Chromium.
-        end = asyncio.get_event_loop().time() + 15.0
-        while True:
-            remaining = end - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                raise ChromeBridgeError(f"CDP timeout waiting for reply to {method}")
-            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
-            try:
-                msg = json.loads(raw)
-            except (ValueError, TypeError):
-                continue
-            if msg.get("id") != msg_id:
-                continue
-            if "error" in msg:
-                raise ChromeBridgeError(
-                    f"CDP error on {method}: {msg['error']!r}"
-                )
-            return msg.get("result", {})
+        try:
+            ws = await _get_ws()
+            _msg_id += 1
+            msg_id = _msg_id
+            # send is unbounded by default; a half-dead TCP socket (state
+            # still OPEN) can block it forever, so cap it too.
+            await asyncio.wait_for(
+                ws.send(
+                    json.dumps({"id": msg_id, "method": method, "params": params or {}})
+                ),
+                timeout=_CDP_CALL_TIMEOUT,
+            )
+            # Bounded read loop: drop unrelated events until our reply lands.
+            end = asyncio.get_event_loop().time() + _CDP_CALL_TIMEOUT
+            while True:
+                remaining = end - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise ChromeBridgeError(f"CDP timeout waiting for reply to {method}")
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if msg.get("id") != msg_id:
+                    continue
+                if "error" in msg:
+                    raise ChromeBridgeError(
+                        f"CDP error on {method}: {msg['error']!r}"
+                    )
+                return msg.get("result", {})
+        except (asyncio.TimeoutError, OSError, websockets.exceptions.ConnectionClosed) as e:
+            # Connect/send/recv stalled or the socket closed — drop the cached
+            # socket so the next call reconnects cleanly instead of reusing a
+            # wedged one.
+            await _drop_ws()
+            raise ChromeBridgeError(f"CDP {method} timed out / connection error: {e}") from e
 
 
 async def fetch_gemini_cookies() -> dict[str, str]:
