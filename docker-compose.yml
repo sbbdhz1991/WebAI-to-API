@@ -35,10 +35,16 @@ services:
       # Optional: route ALL Chromium traffic (login + DBSC rotation) through
       # a clean/residential exit IP to reduce Google revoking the session
       # for originating from a datacenter IP. Empty/unset = direct. Use a
-      # STABLE IP in the account's usual region; IP-whitelist auth (not
-      # user:pass — headless Chromium can't answer a proxy auth dialog).
-      #   e.g. PROXY_SERVER=http://10.0.0.5:8080  or  socks5://10.0.0.5:1080
+      # STABLE IP in the account's usual region (a rotating-IP proxy makes
+      # things worse). Pick ONE of the two below:
+      #   PROXY_SERVER   — proxy needing NO auth (IP-whitelisted). e.g.
+      #                    http://10.0.0.5:8080  or  socks5://10.0.0.5:1080
+      #   PROXY_UPSTREAM — proxy needing user:pass; an in-container tinyproxy
+      #                    bridges it for headless Chromium. e.g.
+      #                    http://user:pass@host:port  or
+      #                    socks5://user:pass@host:port
       - PROXY_SERVER=${PROXY_SERVER:-}
+      - PROXY_UPSTREAM=${PROXY_UPSTREAM:-}
     volumes:
       # Persist Chromium's profile (cookies, DBSC key, history, etc.)
       # across restarts. Without this, every container restart loses

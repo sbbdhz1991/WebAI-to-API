@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
         socat \
         tini \
+        tinyproxy \
         wget \
     && rm -rf /var/lib/apt/lists/*
 

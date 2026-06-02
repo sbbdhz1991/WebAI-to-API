@@ -22,16 +22,28 @@ CDP_INTERNAL_PORT="${CDP_INTERNAL_PORT:-9333}"
 USER_DATA_DIR="${USER_DATA_DIR:-/data/chrome-profile}"
 START_URL="${START_URL:-https://gemini.google.com/app}"
 # Optional upstream proxy for ALL of Chromium's traffic (login + DBSC
-# rotation). Empty = direct (current behaviour, unchanged). Set this to
-# route the Google session through a clean/residential exit IP, which is
-# the single biggest lever against Google revoking a session that it sees
-# originating from a datacenter IP. Format: "http://host:port" or
-# "socks5://host:port". IMPORTANT: prefer a proxy authenticated by
-# IP-whitelist, NOT user:pass — headless Chromium cannot answer a proxy
-# auth dialog, so user:pass proxies need a local non-auth bridge
-# (gost/3proxy/tinyproxy) in front. Use a STABLE exit IP in the account's
+# rotation). Routing the Google session through a clean/residential exit IP
+# is the single biggest lever against Google revoking a session it sees
+# originating from a datacenter IP. Use a STABLE exit IP in the account's
 # usual region; a rotating-IP proxy makes things worse, not better.
+#
+# Two ways to set it (all empty = direct, current behaviour, unchanged):
+#
+#   PROXY_SERVER   — a proxy that needs NO auth (IP-whitelisted). Chromium
+#                    points straight at it. Format:
+#                    "http://host:port" or "socks5://host:port".
+#
+#   PROXY_UPSTREAM — a proxy that needs user:pass. Headless Chromium can't
+#                    answer a proxy auth dialog, so we run a local tinyproxy
+#                    that listens with NO auth on 127.0.0.1 and chains to
+#                    this authenticated upstream; Chromium then points at the
+#                    local bridge. Format includes credentials, e.g.
+#                    "http://user:pass@host:port" or
+#                    "socks5://user:pass@host:port".
+#                    Takes precedence over PROXY_SERVER when both are set.
 PROXY_SERVER="${PROXY_SERVER:-}"
+PROXY_UPSTREAM="${PROXY_UPSTREAM:-}"
+PROXY_BRIDGE_PORT="${PROXY_BRIDGE_PORT:-18080}"
 
 # First-launch privilege gate: when we boot as root (always, in this image),
 # we own the bind-mounted profile dir to the chrome user — the host dir
@@ -134,6 +146,43 @@ socat TCP-LISTEN:"${CDP_PORT}",bind=0.0.0.0,fork,reuseaddr \
       > /tmp/socat.log 2>&1 &
 PIDS+=($!)
 
+# 4c. Authenticated-proxy bridge. When PROXY_UPSTREAM carries credentials,
+# run a local tinyproxy that listens with NO auth on 127.0.0.1 and chains
+# to the authenticated upstream, so headless Chromium (which can't answer a
+# proxy auth dialog) can still use a user:pass proxy. EFFECTIVE_PROXY ends
+# up pointing Chromium at either this bridge, the no-auth PROXY_SERVER, or
+# nothing (direct).
+EFFECTIVE_PROXY="${PROXY_SERVER}"
+if [ -n "${PROXY_UPSTREAM}" ]; then
+    up_scheme="${PROXY_UPSTREAM%%://*}"
+    up_rest="${PROXY_UPSTREAM#*://}"
+    up_creds=""
+    up_hostport="${up_rest}"
+    case "${up_rest}" in
+      *@*) up_creds="${up_rest%@*}"; up_hostport="${up_rest##*@}" ;;
+    esac
+    case "${up_scheme}" in
+      http|https) ty_scheme="http" ;;
+      socks5|socks5h) ty_scheme="socks5" ;;
+      socks4) ty_scheme="socks4" ;;
+      *) echo "[entrypoint] ERROR: unsupported PROXY_UPSTREAM scheme '${up_scheme}'" >&2; exit 1 ;;
+    esac
+    cat > /tmp/tinyproxy.conf <<EOF
+Port ${PROXY_BRIDGE_PORT}
+Listen 127.0.0.1
+Timeout 600
+Allow 127.0.0.1
+LogLevel Info
+Logfile "/tmp/tinyproxy.log"
+PidFile "/tmp/tinyproxy.pid"
+upstream ${ty_scheme} ${up_creds:+${up_creds}@}${up_hostport}
+EOF
+    echo "[entrypoint] starting proxy bridge: 127.0.0.1:${PROXY_BRIDGE_PORT} -> ${up_scheme}://${up_creds:+***@}${up_hostport}"
+    tinyproxy -d -c /tmp/tinyproxy.conf > /tmp/tinyproxy.boot.log 2>&1 &
+    PIDS+=($!)
+    EFFECTIVE_PROXY="http://127.0.0.1:${PROXY_BRIDGE_PORT}"
+fi
+
 # 5. Chromium — foreground; container lives or dies with it.
 # Notes:
 #   --remote-debugging-address=0.0.0.0   exposes CDP to docker network only
@@ -168,8 +217,8 @@ CHROME_ARGS=(
     --window-size=1280,720
     --start-maximized
 )
-if [ -n "${PROXY_SERVER}" ]; then
-    echo "[entrypoint] routing Chromium through proxy: ${PROXY_SERVER}"
-    CHROME_ARGS+=( --proxy-server="${PROXY_SERVER}" )
+if [ -n "${EFFECTIVE_PROXY}" ]; then
+    echo "[entrypoint] routing Chromium through proxy: ${EFFECTIVE_PROXY}"
+    CHROME_ARGS+=( --proxy-server="${EFFECTIVE_PROXY}" )
 fi
 exec chromium "${CHROME_ARGS[@]}" "${START_URL}"
